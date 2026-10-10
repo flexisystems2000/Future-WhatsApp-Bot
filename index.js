@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-render-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@musteqeem/baileys": "^1.0.7",
+    "@google/genai": "^0.1.1",
+    "express": "^4.19.2",
+    "pino": "^9.0.0"
+  }
+}
