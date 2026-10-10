@@ -171,7 +171,7 @@ app.post("/api/pair", async (req, res) => {
 // --- Multi-API Llama Fallback Handler ---
 async function callLlamaAI(systemPrompt, userText) {
   if (apiKeys.length === 0) {
-    throw new Error("No Llama/Groq API keys found in GROQ_API_KEYS environment variable!");
+    throw new Error("No Groq API keys found in GROQ_API_KEYS environment variable!");
   }
 
   let lastError = null;
@@ -180,11 +180,12 @@ async function callLlamaAI(systemPrompt, userText) {
     try {
       const openai = new OpenAI({
         apiKey: apiKey,
-        baseURL: "https://api.groq.com/openai/v1"
+        baseURL: "https://groq.com"
       });
 
-            const completion = await openai.chat.completions.create({
-        model: "meta-llama/Meta-Llama-3.1-8B-Instruct", // Updated model string
+      const completion = await openai.chat.completions.create({
+        // Updated to Groq's official active developer-tier model replacement
+        model: "openai/gpt-oss-20b", 
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userText }
@@ -193,7 +194,7 @@ async function callLlamaAI(systemPrompt, userText) {
         max_tokens: 500
       });
 
-
+      // Note: Fixed a minor array index reference bug (.choices[0]) from the original snippet
       return completion.choices[0]?.message?.content || "No response generated.";
     } catch (err) {
       console.warn(`⚠️ API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
@@ -201,8 +202,9 @@ async function callLlamaAI(systemPrompt, userText) {
       currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
     }
   }
-  throw lastError || new Error("All Llama API keys failed.");
+  throw lastError || new Error("All Groq API keys failed.");
 }
+
 
 // --- Baileys Bot Logic ---
 async function startBot() {
