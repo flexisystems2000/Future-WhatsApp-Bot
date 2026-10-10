@@ -1,9 +1,11 @@
 import makeWASocket, { 
   useMultiFileAuthState, 
   DisconnectReason,
-  downloadMediaMessage
+  downloadContentFromMessage
 } from "@musteqeem/baileys";
+import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
+import { init as initPuter } from "@heyputer/puter.js/src/init.cjs";
 import express from "express";
 import pino from "pino";
 
@@ -12,7 +14,16 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
+
+// 1. Multi-API Key setup for Llama (Groq) rotation
+const apiKeys = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
+let currentKeyIndex = 0;
+
+// 2. Initialize Google Gemini for Vision / Image Analysis
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// 3. Initialize Puter for Image Generation (.imagine)
+const puter = initPuter(process.env.PUTER_AUTH_TOKEN);
 
 // Global runtime variables
 let sock = null;
@@ -32,7 +43,7 @@ app.get("/", (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>WhatsApp Bot Dashboard</title>
+      <title>WhatsApp Multi-AI Bot Dashboard</title>
       <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
@@ -157,6 +168,41 @@ app.post("/api/pair", async (req, res) => {
   }
 });
 
+// --- Multi-API Llama Fallback Handler ---
+async function callLlamaAI(systemPrompt, userText) {
+  if (apiKeys.length === 0) {
+    throw new Error("No Llama/Groq API keys found in GROQ_API_KEYS environment variable!");
+  }
+
+  let lastError = null;
+  for (let i = 0; i < apiKeys.length; i++) {
+    const apiKey = apiKeys[currentKeyIndex];
+    try {
+      const openai = new OpenAI({
+        apiKey: apiKey,
+        baseURL: "https://api.groq.com/openai/v1"
+      });
+
+      const completion = await openai.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userText }
+        ],
+        temperature: 0.7,
+        max_tokens: 500
+      });
+
+      return completion.choices[0]?.message?.content || "No response generated.";
+    } catch (err) {
+      console.warn(`⚠️ API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
+      lastError = err;
+      currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+    }
+  }
+  throw lastError || new Error("All Llama API keys failed.");
+}
+
 // --- Baileys Bot Logic ---
 async function startBot() {
   const { state: authState, saveCreds } = await useMultiFileAuthState("./auth_session");
@@ -178,7 +224,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal WhatsApp Bot Active & Connected!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active & Connected!");
     }
   });
 
@@ -191,33 +237,35 @@ async function startBot() {
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
 
-      // 4. Read Receipts
+      // Read Receipts (Blue ticks)
       if (!isFromMe) {
         await sock.readMessages([msg.key]);
       }
 
-      // 1. Open View Once Messages
-      await handleViewOnce(sock, msg);
-
-      // Extract raw text content
+      // Extract text content or image caption
       const text = 
         msg.message.conversation || 
         msg.message.extendedTextMessage?.text || 
         msg.message.imageMessage?.caption || 
         "";
 
-      if (!text) continue;
-
       // Handle Owner Admin Commands
-      if (isFromMe) {
+      if (isFromMe && text) {
         if (await handleAdminCommands(sock, msg, text, jid)) continue;
       }
 
       // Ignore auto-responses if sent by yourself or if chat is muted
       if (isFromMe || state.mutedChats.has(jid)) continue;
 
-      // 3. Respond only when Away mode is ON
-      if (state.isAway) {
+      // Handle Incoming Images with Gemini Vision
+      const hasImage = msg.message?.imageMessage;
+      if (hasImage && state.isAway) {
+        await handleVisionResponse(sock, msg, hasImage, text || "Describe this image", jid);
+        continue;
+      }
+
+      // Handle Text AI Response with Llama
+      if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
     }
@@ -225,32 +273,7 @@ async function startBot() {
 }
 
 /**
- * Feature 1: Handles incoming View Once Media and sends back a permanent copy
- */
-async function handleViewOnce(sock, msg) {
-  const voMsg = msg.message.viewOnceMessage?.message || 
-                msg.message.viewOnceMessageV2?.message || 
-                msg.message.viewOnceMessageV2Extension?.message;
-
-  if (!voMsg) return;
-
-  try {
-    const mediaType = Object.keys(voMsg)[0];
-    const buffer = await downloadMediaMessage(msg, "buffer", {});
-    
-    let mediaPayload = {};
-    if (mediaType === "imageMessage") mediaPayload = { image: buffer, caption: "🔓 Anti-View Once Image" };
-    else if (mediaType === "videoMessage") mediaPayload = { video: buffer, caption: "🔓 Anti-View Once Video" };
-    else if (mediaType === "audioMessage") mediaPayload = { audio: buffer, ptt: true };
-
-    await sock.sendMessage(msg.key.remoteJid, mediaPayload, { quoted: msg });
-  } catch (err) {
-    console.error("Failed to extract View Once media:", err);
-  }
-}
-
-/**
- * Features 2 & 3: Commands Handler (.menu, .block, .unblock, .away, .mute, .unmute)
+ * Commands Handler (.menu, .vv, .imagine, .away, .mute, .block, etc.)
  */
 async function handleAdminCommands(sock, msg, text, jid) {
   const command = text.trim().toLowerCase();
@@ -260,32 +283,100 @@ async function handleAdminCommands(sock, msg, text, jid) {
     const awayStatus = state.isAway ? "🟢 ON" : "🔴 OFF";
     const isMuted = state.mutedChats.has(jid) ? "🔇 MUTED" : "🔊 UNMUTED";
 
-    const menuText = `🤖 *PERSONAL BOT DASHBOARD*
+    const menuText = `🤖 *PERSONAL MULTI-AI BOT DASHBOARD*
 
 ⚙️ *Bot Status:*
 - Away Mode: ${awayStatus}
 - Chat Status: ${isMuted}
 
 🛠️ *Admin Commands:*
-▫️ \`.away on\` - Enable away auto-responder
-▫️ \`.away off\` - Disable away auto-responder
-▫️ \`.mute\` - Mute bot in this chat
-▫️ \`.unmute\` - Unmute bot in this chat
-▫️ \`.block\` - Block contact (or reply target)
-▫️ \`.unblock\` - Unblock contact (or reply target)
+▫️ \`.vv\` - Reply to View-Once media to download it
+▫️ \`.imagine [prompt]\` - Generate image via Puter AI
+▫️ \`.away on/off\` - Toggle away auto-responder
+▫️ \`.mute / .unmute\` - Mute/Unmute bot in chat
+▫️ \`.block / .unblock\` - Manage blocked contacts
 ▫️ \`.menu\` - Display this dashboard
 
-🌟 *Automatic Features:*
-▫️ *Anti-View Once:* Reveals View Once photos/videos/audios.
-▫️ *Read Receipts:* Sends blue ticks when processing.
-▫️ *AI Assistant:* Natural answers & local time awareness.
-▫️ *Auto Translation:* Translates non-English incoming text.`;
+🌟 *Core Engines:*
+▫️ *Text:* Llama 3.3 70B (Groq 4-Key Rotation)
+▫️ *Vision:* Google Gemini Flash
+▫️ *Images:* Puter AI Engine`;
 
     await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
     return true;
   }
 
-  // Feature 2: Block / Unblock User
+  // View-Once Command (.vv)
+  if (command === ".vv" || command === ".viewonce") {
+    const loadEmojis = ['⏳', '🔓', '👁️'];
+    for (const emoji of loadEmojis) {
+      await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
+    }
+    
+    const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    if (!quoted) {
+      await sock.sendMessage(jid, { text: "❌ Please reply to a View-Once message with .vv" }, { quoted: msg });
+      return true;
+    }
+
+    const viewOnce = quoted.viewOnceMessageV2 || quoted.viewOnceMessage || quoted.viewOnceMessageV2Extension;
+    const message = viewOnce ? viewOnce.message : quoted;
+    let vType = Object.keys(message)[0];
+
+    if (['imageMessage', 'videoMessage', 'audioMessage'].includes(vType)) {
+      try {
+        const stream = await downloadContentFromMessage(message[vType], vType.replace('Message', ''));
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+        
+        if (vType === 'imageMessage') {
+          await sock.sendMessage(jid, { image: buffer, caption: "✅ View-Once Image Downloaded" }, { quoted: msg });
+        } else if (vType === 'videoMessage') {
+          await sock.sendMessage(jid, { video: buffer, caption: "✅ View-Once Video Downloaded" }, { quoted: msg });
+        } else if (vType === 'audioMessage') {
+          await sock.sendMessage(jid, { audio: buffer, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
+        }
+      } catch (e) {
+        console.error("View-once download error:", e);
+        await sock.sendMessage(jid, { text: "❌ Failed to download View-Once media." }, { quoted: msg });
+      }
+    } else {
+      await sock.sendMessage(jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
+    }
+    return true;
+  }
+
+  // Image Generation Command (.imagine)
+  if (command.startsWith(".imagine ") || command.startsWith(".image ")) {
+    const prompt = text.replace(/^\.(imagine|image)\s+/i, "").trim();
+    if (!prompt) {
+      await sock.sendMessage(jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
+      return true;
+    }
+
+    await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
+    await sock.sendPresenceUpdate('composing', jid);
+
+    try {
+      const imageResult = await puter.ai.txt2img(prompt);
+      const imageUrl = imageResult.src || imageResult.url || imageResult;
+
+      if (!imageUrl) throw new Error("No image URL returned.");
+
+      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendMessage(jid, { 
+        image: { url: imageUrl }, 
+        caption: `🎨 *Generated Image*\nPrompt: "${prompt}"` 
+      }, { quoted: msg });
+    } catch (err) {
+      console.error("Image generation error:", err);
+      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendMessage(jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
+    }
+    return true;
+  }
+
+  // Block / Unblock User
   if (command.startsWith(".block")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "block");
@@ -300,7 +391,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // Feature 3: Away Mode Control
+  // Away Mode Control
   if (command === ".away on") {
     state.isAway = true;
     await sock.sendMessage(jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
@@ -312,7 +403,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // Feature 3: Mute / Unmute Per Chat
+  // Mute / Unmute Per Chat
   if (command === ".mute") {
     state.mutedChats.add(jid);
     await sock.sendMessage(jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
@@ -328,36 +419,78 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * Features 5, 6, 7 & 8: AI Engine with Natural Language, Time Teller, and Translation
+ * Llama Text AI Response with Typing Animation
  */
 async function handleAIResponse(sock, msg, text, jid) {
-  const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
-  const currentDate = new Date().toLocaleDateString();
-
-  const systemInstruction = `
-    You are a personal WhatsApp AI assistant replying on behalf of your owner who is currently away.
-    - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
-    - Goal 1: Respond naturally, concisely, and helpfully to questions.
-    - Goal 2: If asked about time or date, answer using the current context provided above.
-    - Goal 3: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
-      "[Translation: <English translation>]" followed by your response in the user's native language (or in English).
-    - Keep responses short and suitable for chat messages.
-  `;
-
   try {
+    await sock.sendPresenceUpdate('composing', jid);
+
+    const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+    const currentDate = new Date().toLocaleDateString();
+
+    const systemInstruction = `
+      You are a personal WhatsApp AI assistant powered by Llama, replying on behalf of your owner who is currently away.
+      - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
+      - Goal 1: Respond naturally, concisely, and helpfully to questions.
+      - Goal 2: If asked about time or date, answer using the current context provided above.
+      - Goal 3: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
+        "[Translation: <English translation>]" followed by your response in the user's native language (or in English).
+      - Keep responses short and suitable for chat messages.
+    `;
+
+    const replyText = await callLlamaAI(systemInstruction, text);
+
+    // Artificial typing delay for realism (2.5 seconds)
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    if (replyText) {
+      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendMessage(jid, { text: replyText }, { quoted: msg });
+    }
+  } catch (err) {
+    console.error("Llama AI error:", err);
+    await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+  }
+}
+
+/**
+ * Gemini Vision Handler for Incoming Images
+ */
+async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
+  try {
+    await sock.sendPresenceUpdate('composing', jid);
+
+    // Download image stream from Baileys
+    const stream = await downloadContentFromMessage(imageMessage, 'image');
+    let buffer = Buffer.from([]);
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+    const base64Image = buffer.toString("base64");
+
+    // Call Gemini Flash for Vision Analysis
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
-      contents: text,
-      config: {
-        systemInstruction: systemInstruction,
-      }
+      contents: [
+        {
+          inlineData: {
+            data: base64Image,
+            mimeType: "image/jpeg"
+          }
+        },
+        { text: `You are a personal AI assistant. Answer this user prompt regarding the image: ${promptText}` }
+      ]
     });
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await sock.sendPresenceUpdate('paused', jid);
 
     if (response.text) {
       await sock.sendMessage(jid, { text: response.text }, { quoted: msg });
     }
   } catch (err) {
-    console.error("Gemini AI error:", err);
+    console.error("Gemini Vision error:", err);
+    await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+    await sock.sendMessage(jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
   }
 }
 
