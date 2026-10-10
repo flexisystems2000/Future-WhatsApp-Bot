@@ -457,7 +457,8 @@ async function handleAIResponse(sock, msg, text, jid) {
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       - Goal 1: Respond naturally, concisely, and helpfully to questions.
       - Goal 2: If asked about time or date, answer using the current context provided above.
-      - Goal 3: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
+      - Goal 3: Mathematical Formatting: Whenever you write mathematical formulas, expressions, equations, or numbers, strictly use Unicode text characters (such as superscript/subscript digits like x², H₂O, square roots √, fractions like 1/2, operators like ±, ≤, ≥, ≠, ×, ÷, ∫, ∑). NEVER use LaTeX syntax, backslashes (\\), or dollar signs ($) for math, as they break and look weird on WhatsApp.
+      - Goal 4: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
         "[Translation: <English translation>]" followed by your response in the user's native language (or in English).
       - Keep responses short and suitable for chat messages.
     `;
