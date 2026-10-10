@@ -15,8 +15,8 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
-// 1. Multi-API Key setup for Llama (Groq) rotation
-const apiKeys = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
+// 1. Multi-API Key setup for OpenRouter rotation
+const apiKeys = (process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
 let currentKeyIndex = 0;
 
 // 2. Initialize Google Gemini for Vision / Image Analysis
@@ -168,24 +168,23 @@ app.post("/api/pair", async (req, res) => {
   }
 });
 
-// --- Multi-API Llama Fallback Handler ---
-async function callLlamaAI(systemPrompt, userText) {
+// --- OpenRouter AI Handler with Multi-Key Rotation ---
+async function callOpenRouterAI(systemPrompt, userText) {
   if (apiKeys.length === 0) {
-    throw new Error("No Groq API keys found in GROQ_API_KEYS environment variable!");
+    throw new Error("No OpenRouter API keys found in OPENROUTER_API_KEYS environment variable!");
   }
 
   let lastError = null;
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[currentKeyIndex];
     try {
-      const openai = new OpenAI({
+      const openrouter = new OpenAI({
         apiKey: apiKey,
-        baseURL: "https://groq.com"
+        baseURL: "https://openrouter.ai/api/v1"
       });
 
-      const completion = await openai.chat.completions.create({
-        // Updated to Groq's official active developer-tier model replacement
-        model: "openai/gpt-oss-20b", 
+      const completion = await openrouter.chat.completions.create({
+        model: "meta-llama/llama-3.3-70b-instruct:free", // OpenRouter Free Tier Model
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userText }
@@ -194,17 +193,15 @@ async function callLlamaAI(systemPrompt, userText) {
         max_tokens: 500
       });
 
-      // Note: Fixed a minor array index reference bug (.choices[0]) from the original snippet
       return completion.choices[0]?.message?.content || "No response generated.";
     } catch (err) {
-      console.warn(`⚠️ API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
+      console.warn(`⚠️ OpenRouter API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
       lastError = err;
       currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
     }
   }
-  throw lastError || new Error("All Groq API keys failed.");
+  throw lastError || new Error("All OpenRouter API keys failed.");
 }
-
 
 // --- Baileys Bot Logic ---
 async function startBot() {
@@ -227,7 +224,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active & Connected!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active & Connected via OpenRouter Rotation!");
     }
   });
 
@@ -267,7 +264,7 @@ async function startBot() {
         continue;
       }
 
-      // Handle Text AI Response with Llama
+      // Handle Text AI Response with OpenRouter Rotation
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
@@ -301,7 +298,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
 ▫️ \`.menu\` - Display this dashboard
 
 🌟 *Core Engines:*
-▫️ *Text:* Llama 3.3 70B (Groq 4-Key Rotation)
+▫️ *Text:* OpenRouter (Llama 3.3 70B Free Rotation)
 ▫️ *Vision:* Google Gemini Flash
 ▫️ *Images:* Puter AI Engine`;
 
@@ -361,8 +358,8 @@ async function handleAdminCommands(sock, msg, text, jid) {
     await sock.sendPresenceUpdate('composing', jid);
 
     try {
-      const imageResult = await puter.ai.txt2img(prompt);
-      const imageUrl = imageResult.src || imageResult.url || imageResult;
+      const imageElement = await puter.ai.txt2img(prompt);
+      const imageUrl = imageElement.src || imageElement.url;
 
       if (!imageUrl) throw new Error("No image URL returned.");
 
@@ -422,7 +419,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * Llama Text AI Response with Typing Animation
+ * OpenRouter AI Text Response with Typing Animation
  */
 async function handleAIResponse(sock, msg, text, jid) {
   try {
@@ -432,7 +429,7 @@ async function handleAIResponse(sock, msg, text, jid) {
     const currentDate = new Date().toLocaleDateString();
 
     const systemInstruction = `
-      You are a personal WhatsApp AI assistant powered by Llama, replying on behalf of your owner who is currently away.
+      You are a personal WhatsApp AI assistant powered by OpenRouter, replying on behalf of your owner who is currently away.
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       - Goal 1: Respond naturally, concisely, and helpfully to questions.
       - Goal 2: If asked about time or date, answer using the current context provided above.
@@ -441,7 +438,7 @@ async function handleAIResponse(sock, msg, text, jid) {
       - Keep responses short and suitable for chat messages.
     `;
 
-    const replyText = await callLlamaAI(systemInstruction, text);
+    const replyText = await callOpenRouterAI(systemInstruction, text);
 
     // Artificial typing delay for realism (2.5 seconds)
     await new Promise(resolve => setTimeout(resolve, 2500));
@@ -451,7 +448,7 @@ async function handleAIResponse(sock, msg, text, jid) {
       await sock.sendMessage(jid, { text: replyText }, { quoted: msg });
     }
   } catch (err) {
-    console.error("Llama AI error:", err);
+    console.error("OpenRouter AI error:", err);
     await sock.sendPresenceUpdate('paused', jid).catch(() => {});
   }
 }
@@ -463,14 +460,12 @@ async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
   try {
     await sock.sendPresenceUpdate('composing', jid);
 
-    // Download image stream from Baileys
     const stream = await downloadContentFromMessage(imageMessage, 'image');
     let buffer = Buffer.from([]);
     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
     const base64Image = buffer.toString("base64");
 
-    // Call Gemini Flash for Vision Analysis
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: [
