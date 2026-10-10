@@ -183,8 +183,8 @@ async function callLlamaAI(systemPrompt, userText) {
         baseURL: "https://api.groq.com/openai/v1"
       });
 
-      const completion = await openai.chat.completions.create({
-        model: "llama-3.1-8b-instant",
+            const completion = await openai.chat.completions.create({
+        model: "meta-llama/Meta-Llama-3.1-8B-Instruct", // Updated model string
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userText }
@@ -192,6 +192,7 @@ async function callLlamaAI(systemPrompt, userText) {
         temperature: 0.7,
         max_tokens: 500
       });
+
 
       return completion.choices[0]?.message?.content || "No response generated.";
     } catch (err) {
