@@ -184,7 +184,7 @@ async function callOpenRouterGemini(systemPrompt, userText) {
       });
 
       const completion = await openrouter.chat.completions.create({
-        model: "google/gemini-2.5-flash", // Swapped to Gemini via OpenRouter gateway
+        model: "google/gemini-2.5-flash",
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userText }
@@ -249,9 +249,18 @@ async function startBot() {
         msg.message.imageMessage?.caption || 
         "";
 
-      // Handle Owner Admin Commands
-      if (isFromMe && text) {
-        if (await handleAdminCommands(sock, msg, text, jid)) continue;
+      if (!text && !msg.message?.imageMessage) continue;
+
+      // 1. PUBLIC COMMANDS (Accessible by ANY sender and the Bot Owner)
+      if (text.startsWith(".")) {
+        const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
+        if (handledPublic) continue;
+      }
+
+      // 2. OWNER-ONLY ADMIN COMMANDS (Accessible ONLY by the Bot Owner)
+      if (isFromMe && text.startsWith(".")) {
+        const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
+        if (handledAdmin) continue;
       }
 
       // Ignore auto-responses if sent by yourself or if chat is muted
@@ -273,9 +282,10 @@ async function startBot() {
 }
 
 /**
- * Commands Handler (.menu, .vv, .imagine, .away, .mute, .block, etc.)
+ * Public Commands Handler (.imagine, .image, .menu)
+ * Works for BOTH external senders and the owner.
  */
-async function handleAdminCommands(sock, msg, text, jid) {
+async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
   const command = text.trim().toLowerCase();
 
   // Menu Command
@@ -283,28 +293,72 @@ async function handleAdminCommands(sock, msg, text, jid) {
     const awayStatus = state.isAway ? "🟢 ON" : "🔴 OFF";
     const isMuted = state.mutedChats.has(jid) ? "🔇 MUTED" : "🔊 UNMUTED";
 
-    const menuText = `🤖 *PERSONAL MULTI-AI BOT DASHBOARD*
+    let menuText = `🤖 *MULTI-AI WHATSAPP BOT*
 
-⚙️ *Bot Status:*
+🎨 *Public Commands:*
+▫️ \`.imagine [prompt]\` - Generate image via Puter AI
+▫️ \`.menu\` - Display available commands`;
+
+    if (isFromMe) {
+      menuText += `\n\n⚙️ *Owner Settings:*
 - Away Mode: ${awayStatus}
 - Chat Status: ${isMuted}
 
-🛠️ *Admin Commands:*
+🛠️ *Owner Admin Commands:*
 ▫️ \`.vv\` - Reply to View-Once media to download it
-▫️ \`.imagine [prompt]\` - Generate image via Puter AI
 ▫️ \`.away on/off\` - Toggle away auto-responder
 ▫️ \`.mute / .unmute\` - Mute/Unmute bot in chat
-▫️ \`.block / .unblock\` - Manage blocked contacts
-▫️ \`.menu\` - Display this dashboard
+▫️ \`.block / .unblock\` - Manage blocked contacts`;
+    }
 
-🌟 *Core Engines:*
-▫️ *Text:* Google Gemini via OpenRouter Rotation
+    menuText += `\n\n🌟 *Core Engines:*
+▫️ *Text:* Google Gemini via OpenRouter
 ▫️ *Vision:* Google Gemini Flash
 ▫️ *Images:* Puter AI Engine`;
 
     await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
     return true;
   }
+
+  // Image Generation Command (.imagine / .image)
+  if (command.startsWith(".imagine ") || command.startsWith(".image ")) {
+    const prompt = text.replace(/^\.(imagine|image)\s+/i, "").trim();
+    if (!prompt) {
+      await sock.sendMessage(jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
+      return true;
+    }
+
+    await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
+    await sock.sendPresenceUpdate('composing', jid);
+
+    try {
+      const imageElement = await puter.ai.txt2img(prompt);
+      const imageUrl = imageElement.src || imageElement.url;
+
+      if (!imageUrl) throw new Error("No image URL returned.");
+
+      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendMessage(jid, { 
+        image: { url: imageUrl }, 
+        caption: `🎨 *Generated Image*\nPrompt: "${prompt}"` 
+      }, { quoted: msg });
+    } catch (err) {
+      console.error("Image generation error:", err);
+      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendMessage(jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Admin Commands Handler (.vv, .away, .mute, .block, etc.)
+ * Strictly Restricted to the Bot Owner (isFromMe = true)
+ */
+async function handleAdminCommands(sock, msg, text, jid) {
+  const command = text.trim().toLowerCase();
 
   // View-Once Command (.vv)
   if (command === ".vv" || command === ".viewonce") {
@@ -342,36 +396,6 @@ async function handleAdminCommands(sock, msg, text, jid) {
       }
     } else {
       await sock.sendMessage(jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
-    }
-    return true;
-  }
-
-  // Image Generation Command (.imagine)
-  if (command.startsWith(".imagine ") || command.startsWith(".image ")) {
-    const prompt = text.replace(/^\.(imagine|image)\s+/i, "").trim();
-    if (!prompt) {
-      await sock.sendMessage(jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
-      return true;
-    }
-
-    await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
-    await sock.sendPresenceUpdate('composing', jid);
-
-    try {
-      const imageElement = await puter.ai.txt2img(prompt);
-      const imageUrl = imageElement.src || imageElement.url;
-
-      if (!imageUrl) throw new Error("No image URL returned.");
-
-      await sock.sendPresenceUpdate('paused', jid);
-      await sock.sendMessage(jid, { 
-        image: { url: imageUrl }, 
-        caption: `🎨 *Generated Image*\nPrompt: "${prompt}"` 
-      }, { quoted: msg });
-    } catch (err) {
-      console.error("Image generation error:", err);
-      await sock.sendPresenceUpdate('paused', jid);
-      await sock.sendMessage(jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
     }
     return true;
   }
