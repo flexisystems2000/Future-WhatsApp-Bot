@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp-render-bot",
+  "name": "whatsapp-ai-bot",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
@@ -7,9 +7,11 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@google/genai": "^0.1.1",
+    "@heyputer/puter.js": "^0.0.12",
     "@musteqeem/baileys": "^1.0.7",
-    "@google/genai": "^2.0.0",
     "express": "^4.19.2",
+    "openai": "^4.28.0",
     "pino": "^9.0.0"
   }
 }
