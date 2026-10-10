@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.0.0",
-    "@heyputer/puter.js": "^0.0.12",
+    "@heyputer/puter.js": "latest",
     "@musteqeem/baileys": "^1.0.7",
     "express": "^4.19.2",
     "openai": "^4.28.0",
