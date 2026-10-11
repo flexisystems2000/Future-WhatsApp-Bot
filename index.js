@@ -88,7 +88,7 @@ const state = {
   checkedChats: new Set()
 };
 
-// --- Safe Helper Wrapper (Applies AI Badge & Meta Labels ONLY in Private Chats to avoid group errors) ---
+// --- Clean Safe Helper Wrapper (AI Badge & Meta Secure Label ONLY in Private Chats) ---
 async function sendBotMessage(targetSock, jid, messageContent, options = {}) {
   const jidStr = typeof jid === 'string' ? jid : (Array.isArray(jid) ? jid[0] : '');
   const isPrivateChat = jidStr && (jidStr.endsWith('@s.whatsapp.net') || jidStr.endsWith('@lid')) && !jidStr.includes('@g.us');
@@ -98,18 +98,6 @@ async function sendBotMessage(targetSock, jid, messageContent, options = {}) {
   if (isPrivateChat) {
     enhancedPayload.ai = true;
     enhancedPayload.secureMetaServiceLabel = true;
-    enhancedPayload.contextInfo = {
-      ...(messageContent.contextInfo || {}),
-      forwardingScore: 999,
-      isForwarded: true,
-      participant: "0@s.whatsapp.net",
-      remoteJid: "0@s.whatsapp.net",
-      forwardedNewsletterMessageInfo: {
-        newsletterJid: '120363423325164241@newsletter',
-        newsletterName: '🔖 𝓂𝓊𝓈𝓉ℯ𝓆ℯ𝓮𝓂 𝓿ℯ𝓻𝓲𝓯𝓲𝓮𝓭 ✓',
-        serverMessageId: 1
-      }
-    };
   }
 
   return await targetSock.sendMessage(jid, enhancedPayload, options);
@@ -366,7 +354,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Safe Meta Badges & Media Vault!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Clean Private AI Badges & Media Vault!");
     }
   });
 
