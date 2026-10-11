@@ -8,6 +8,7 @@ import { GoogleGenAI } from "@google/genai";
 import { init as initPuter } from "@heyputer/puter.js/src/init.cjs";
 import express from "express";
 import fs from "fs";
+import path from "path";
 import pino from "pino";
 
 const app = express();
@@ -16,15 +17,23 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const KNOWLEDGE_FILE = "./knowledge.json";
+const MEDIA_DIR = "./media";
+const MEDIA_FILE = "./media_knowledge.json";
 
-// Helper functions for Knowledge Base
+// Ensure media directory exists
+if (!fs.existsSync(MEDIA_DIR)) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+}
+
+// Helper functions for Text Knowledge Base
 function loadKnowledge() {
   try {
     if (fs.existsSync(KNOWLEDGE_FILE)) {
-      return JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf8"));
+      const data = JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf8"));
+      if (Array.isArray(data)) return data;
     }
   } catch (e) {
-    console.error("Error loading knowledge file:", e);
+    console.error("Error loading knowledge file:", e.message);
   }
   return [];
 }
@@ -34,6 +43,27 @@ function saveKnowledge(data) {
     fs.writeFileSync(KNOWLEDGE_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error("Error saving knowledge file:", e);
+  }
+}
+
+// Helper functions for Media Vault
+function loadMediaKnowledge() {
+  try {
+    if (fs.existsSync(MEDIA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(MEDIA_FILE, "utf8"));
+      if (Array.isArray(data)) return data;
+    }
+  } catch (e) {
+    console.error("Error loading media knowledge file:", e.message);
+  }
+  return [];
+}
+
+function saveMediaKnowledge(data) {
+  try {
+    fs.writeFileSync(MEDIA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("Error saving media knowledge file:", e);
   }
 }
 
@@ -54,8 +84,19 @@ let isConnected = false;
 // Bot Memory State
 const state = {
   isAway: true,
-  mutedChats: new Set()
+  mutedChats: new Set(),
+  checkedChats: new Set()
 };
+
+// --- Helper Wrapper for Musteqeem's Baileys Fork (AI Badge & Meta Secure Label) ---
+async function sendBotMessage(targetSock, jid, messageContent, options = {}) {
+  const enhancedPayload = {
+    ...messageContent,
+    ai: true,
+    secureMetaServiceLabel: true
+  };
+  return await targetSock.sendMessage(jid, enhancedPayload, options);
+}
 
 // --- Web Dashboard UI ---
 app.get("/", (req, res) => {
@@ -190,7 +231,7 @@ app.post("/api/pair", async (req, res) => {
   }
 });
 
-// --- OpenRouter Gemini AI Handler with Multi-Key Rotation ---
+// --- OpenRouter Gemini AI Handler ---
 async function callOpenRouterGemini(systemPrompt, userText) {
   if (apiKeys.length === 0) {
     throw new Error("No OpenRouter API keys found in OPENROUTER_API_KEYS environment variable!");
@@ -225,7 +266,7 @@ async function callOpenRouterGemini(systemPrompt, userText) {
   throw lastError || new Error("All OpenRouter API keys failed.");
 }
 
-// --- Background Auto-Learning Function ---
+// --- Background Auto-Learning from Text ---
 async function extractAndLearnFact(ownerMessage) {
   if (!ownerMessage || ownerMessage.length < 12 || ownerMessage.startsWith(".")) return;
 
@@ -237,9 +278,9 @@ async function extractAndLearnFact(ownerMessage) {
       - Message: "${ownerMessage}"
 
       Rules:
-      1. If the message states a clear fact/price (e.g., "A pen costs 2k", "We close at 8pm", "Delivery to Ikeja is 1500"), return ONLY the concise factual statement.
-      2. If the message is just a casual greeting, personal chat, small talk, or temporary answer (e.g. "I will call you back", "How are you?"), return EXACTLY "NONE".
-      3. Do NOT add explanation, markdown, or quotation marks. Return ONLY the factual statement or NONE.
+      1. If the message states a clear fact/price, return ONLY the concise factual statement.
+      2. If it is just casual greeting or temporary answer, return EXACTLY "NONE".
+      3. Do NOT add explanation or quotes. Return ONLY the factual statement or NONE.
     `;
 
     const extractedFact = await callOpenRouterGemini(extractionPrompt, "Extract fact if present.");
@@ -251,11 +292,39 @@ async function extractAndLearnFact(ownerMessage) {
       if (!exists) {
         knowledge.push(cleanFact);
         saveKnowledge(knowledge);
-        console.log(`🧠 [Auto-Learned New Fact]: "${cleanFact}"`);
+        console.log(`🧠 [Auto-Learned Text Fact]: "${cleanFact}"`);
       }
     }
   } catch (err) {
-    console.error("Auto-learning extraction error:", err.message);
+    console.error("Text auto-learning error:", err.message);
+  }
+}
+
+// --- Archive Image & Instruction to Media Vault ---
+async function archiveMediaWithInstruction(imageMessage, instructionText) {
+  try {
+    const stream = await downloadContentFromMessage(imageMessage, 'image');
+    let buffer = Buffer.from([]);
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+    
+    const fileName = `media_${Date.now()}.jpg`;
+    const filePath = path.join(MEDIA_DIR, fileName);
+    fs.writeFileSync(filePath, buffer);
+
+    const cleanInstruction = instructionText ? instructionText.replace(/^\.remember\s*/i, "").trim() : "Important business image";
+    const mediaVault = loadMediaKnowledge();
+    
+    mediaVault.push({
+      path: filePath,
+      instruction: cleanInstruction
+    });
+
+    saveMediaKnowledge(mediaVault);
+    console.log(`📸 [Media Vault Saved]: "${cleanInstruction}" -> ${filePath}`);
+    return cleanInstruction;
+  } catch (err) {
+    console.error("Media archival error:", err.message);
+    return null;
   }
 }
 
@@ -280,7 +349,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Hybrid Memory & Disappearing Message Protection!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Secure Service Meta Label & Media Vault!");
     }
   });
 
@@ -293,16 +362,20 @@ async function startBot() {
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
 
-      // 1. Auto-Reset Disappearing Messages to Default (Off = 0)
+      // 1. Universal Secure Service Protocol Enforcement
+      if (!isFromMe && !state.checkedChats.has(jid)) {
+        try {
+          await sendBotMessage(sock, jid, { disappearingMessagesInChat: false });
+          state.checkedChats.add(jid);
+        } catch (err) {}
+      }
+
       if (msg.messageStubType) {
         const isEphemeralChange = (msg.messageStubType === 1 || msg.messageStubType === 68);
         if (isEphemeralChange && !isFromMe) {
           try {
-            await sock.sendMessage(jid, { disappearingMessagesInChat: 0 });
-            console.log(`🔒 Reset disappearing messages timer to default for chat: ${jid}`);
-          } catch (err) {
-            console.error("Failed to reset disappearing message timer:", err.message);
-          }
+            await sendBotMessage(sock, jid, { disappearingMessagesInChat: false });
+          } catch (err) {}
         }
       }
 
@@ -311,44 +384,57 @@ async function startBot() {
         await sock.readMessages([msg.key]);
       }
 
-      // Extract text content or image caption
       const text = 
         msg.message.conversation || 
         msg.message.extendedTextMessage?.text || 
         msg.message.imageMessage?.caption || 
         "";
 
+      // 2. OWNER ACTIONS & MEDIA ARCHIVING
+      if (isFromMe) {
+        const hasImage = msg.message?.imageMessage;
+
+        if (hasImage) {
+          const savedInstruction = await archiveMediaWithInstruction(hasImage, text);
+          if (savedInstruction) {
+            await sendBotMessage(sock, jid, { text: `✅ *Image Saved to Media Vault!* Link instruction:\n"${savedInstruction}"` }, { quoted: msg });
+          }
+          continue;
+        }
+
+        if (text.startsWith(".")) {
+          const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
+          if (handledPublic) continue;
+          const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
+          if (handledAdmin) continue;
+        }
+
+        if (text && !text.startsWith(".")) {
+          extractAndLearnFact(text).catch(e => console.error(e));
+          continue;
+        }
+
+        continue;
+      }
+
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 2. PUBLIC COMMANDS (Accessible by ANY sender and the Bot Owner)
+      // 3. PUBLIC COMMANDS FOR CLIENTS
       if (text.startsWith(".")) {
         const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
         if (handledPublic) continue;
       }
 
-      // 3. OWNER-ONLY ADMIN & KNOWLEDGE COMMANDS
-      if (isFromMe && text.startsWith(".")) {
-        const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
-        if (handledAdmin) continue;
-      }
+      if (state.mutedChats.has(jid)) continue;
 
-      // 4. OWNER AUTO-LEARNING (Passively learn facts from your outgoing conversations)
-      if (isFromMe && text && !text.startsWith(".")) {
-        extractAndLearnFact(text).catch(e => console.error(e));
-        continue;
-      }
-
-      // Ignore auto-responses if sent by yourself or if chat is muted
-      if (isFromMe || state.mutedChats.has(jid)) continue;
-
-      // Handle Incoming Images with Gemini Vision
+      // Handle Incoming Customer Images with Gemini Vision
       const hasImage = msg.message?.imageMessage;
       if (hasImage && state.isAway) {
         await handleVisionResponse(sock, msg, hasImage, text || "Describe this image", jid);
         continue;
       }
 
-      // Handle Text AI Response with OpenRouter Gemini Rotation & Shared Knowledge
+      // Handle Text AI Response with Text Knowledge & Media Vault Recall
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
@@ -362,7 +448,6 @@ async function startBot() {
 async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
   const command = text.trim().toLowerCase();
 
-  // Menu Command
   if (command === ".menu" || command === ".help") {
     const awayStatus = state.isAway ? "🟢 ON" : "🔴 OFF";
     const isMuted = state.mutedChats.has(jid) ? "🔇 MUTED" : "🔊 UNMUTED";
@@ -379,7 +464,8 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 - Chat Status: ${isMuted}
 
 🛠️ *Owner Admin & Memory Commands:*
-▫️ \`.knowledge\` - View all auto-learned & saved facts
+▫️ \`.knowledge\` - View all learned text facts
+▫️ \`.media\` - View all archived images & screenshots in vault
 ▫️ \`.remember [fact]\` - Manually teach bot a fact
 ▫️ \`.forget [number]\` - Delete a saved fact
 ▫️ \`.vv\` - Reply to View-Once media
@@ -393,15 +479,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 ▫️ *Vision:* Google Gemini Flash
 ▫️ *Images:* Puter AI Engine`;
 
-    await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: menuText }, { quoted: msg });
     return true;
   }
 
-  // Image Generation Command (.imagine / .image)
   if (command.startsWith(".imagine ") || command.startsWith(".image ")) {
     const prompt = text.replace(/^\.(imagine|image)\s+/i, "").trim();
     if (!prompt) {
-      await sock.sendMessage(jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
       return true;
     }
 
@@ -415,14 +500,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
       if (!imageUrl) throw new Error("No image URL returned.");
 
       await sock.sendPresenceUpdate('paused', jid);
-      await sock.sendMessage(jid, { 
+      await sendBotMessage(sock, jid, { 
         image: { url: imageUrl }, 
         caption: `🎨 *Generated Image*\nPrompt: "${prompt}"` 
       }, { quoted: msg });
     } catch (err) {
       console.error("Image generation error:", err);
       await sock.sendPresenceUpdate('paused', jid);
-      await sock.sendMessage(jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
     }
     return true;
   }
@@ -436,11 +521,10 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 async function handleAdminCommands(sock, msg, text, jid) {
   const commandLower = text.trim().toLowerCase();
 
-  // 1. Remember a fact manually (.remember <fact>)
   if (commandLower.startsWith(".remember ")) {
     const fact = text.replace(/^\.remember\s+/i, "").trim();
     if (!fact) {
-      await sock.sendMessage(jid, { text: "❌ Please provide a fact to remember. Example: `.remember Pen is 2k`" }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Please provide a fact to remember. Example: `.remember Pen is 2k`" }, { quoted: msg });
       return true;
     }
 
@@ -448,42 +532,51 @@ async function handleAdminCommands(sock, msg, text, jid) {
     knowledge.push(fact);
     saveKnowledge(knowledge);
 
-    await sock.sendMessage(jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
     return true;
   }
 
-  // 2. View all auto-learned & saved knowledge (.knowledge)
   if (commandLower === ".knowledge" || commandLower === ".facts") {
     const knowledge = loadKnowledge();
     if (knowledge.length === 0) {
-      await sock.sendMessage(jid, { text: "📂 Memory is empty. Chat with contacts normally or use `.remember [fact]` to build knowledge." }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "📂 Memory is empty. Send text normally or use `.remember [fact]` to build knowledge." }, { quoted: msg });
       return true;
     }
 
     const listText = knowledge.map((item, idx) => `*${idx + 1}.* ${item}`).join("\n");
-    await sock.sendMessage(jid, { text: `📂 *Learned Knowledge Base:*\n\n${listText}\n\n_To delete an entry, type .forget [number]_` }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: `📂 *Learned Text Knowledge Base:*\n\n${listText}\n\n_To delete an entry, type .forget [number]_` }, { quoted: msg });
     return true;
   }
 
-  // 3. Forget a specific fact (.forget <number>)
+  if (commandLower === ".media" || commandLower === ".vault") {
+    const mediaVault = loadMediaKnowledge();
+    if (mediaVault.length === 0) {
+      await sendBotMessage(sock, jid, { text: "📂 Media vault is empty. Send screenshots or flyers with captions to archive them." }, { quoted: msg });
+      return true;
+    }
+
+    const listText = mediaVault.map((item, idx) => `*${idx + 1}.* ${item.instruction} (${path.basename(item.path)})`).join("\n");
+    await sendBotMessage(sock, jid, { text: `📸 *Archived Media Vault:*\n\n${listText}\n\n_The bot will automatically send these images when clients ask about them._` }, { quoted: msg });
+    return true;
+  }
+
   if (commandLower.startsWith(".forget ")) {
     const indexStr = text.replace(/^\.forget\s+/i, "").trim();
     const index = parseInt(indexStr) - 1;
     const knowledge = loadKnowledge();
 
     if (isNaN(index) || index < 0 || index >= knowledge.length) {
-      await sock.sendMessage(jid, { text: "❌ Invalid number. Type `.knowledge` and use `.forget [number]`." }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Invalid number. Type `.knowledge` and use `.forget [number]`." }, { quoted: msg });
       return true;
     }
 
     const removed = knowledge.splice(index, 1);
     saveKnowledge(knowledge);
 
-    await sock.sendMessage(jid, { text: `🗑️ *Removed from memory:* "${removed[0]}"` }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: `🗑️ *Removed from memory:* "${removed[0]}"` }, { quoted: msg });
     return true;
   }
 
-  // View-Once Command (.vv)
   if (commandLower === ".vv" || commandLower === ".viewonce") {
     const loadEmojis = ['⏳', '🔓', '👁️'];
     for (const emoji of loadEmojis) {
@@ -492,7 +585,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
     
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     if (!quoted) {
-      await sock.sendMessage(jid, { text: "❌ Please reply to a View-Once message with .vv" }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Please reply to a View-Once message with .vv" }, { quoted: msg });
       return true;
     }
 
@@ -507,58 +600,54 @@ async function handleAdminCommands(sock, msg, text, jid) {
         for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
         
         if (vType === 'imageMessage') {
-          await sock.sendMessage(jid, { image: buffer, caption: "✅ View-Once Image Downloaded" }, { quoted: msg });
+          await sendBotMessage(sock, jid, { image: buffer, caption: "✅ View-Once Image Downloaded" }, { quoted: msg });
         } else if (vType === 'videoMessage') {
-          await sock.sendMessage(jid, { video: buffer, caption: "✅ View-Once Video Downloaded" }, { quoted: msg });
+          await sendBotMessage(sock, jid, { video: buffer, caption: "✅ View-Once Video Downloaded" }, { quoted: msg });
         } else if (vType === 'audioMessage') {
-          await sock.sendMessage(jid, { audio: buffer, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
+          await sendBotMessage(sock, jid, { audio: buffer, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
         }
       } catch (e) {
-        console.error("View-once download error:", e);
-        await sock.sendMessage(jid, { text: "❌ Failed to download View-Once media." }, { quoted: msg });
+        await sendBotMessage(sock, jid, { text: "❌ Failed to download View-Once media." }, { quoted: msg });
       }
     } else {
-      await sock.sendMessage(jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
     }
     return true;
   }
 
-  // Block / Unblock User
   if (commandLower.startsWith(".block")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "block");
-    await sock.sendMessage(jid, { text: "🚫 User blocked." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "🚫 User blocked." }, { quoted: msg });
     return true;
   }
   
   if (commandLower.startsWith(".unblock")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "unblock");
-    await sock.sendMessage(jid, { text: "✅ User unblocked." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "✅ User unblocked." }, { quoted: msg });
     return true;
   }
 
-  // Away Mode Control
   if (commandLower === ".away on") {
     state.isAway = true;
-    await sock.sendMessage(jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
     return true;
   }
   if (commandLower === ".away off") {
     state.isAway = false;
-    await sock.sendMessage(jid, { text: "☀️ Away mode deactivated. Bot will stay quiet." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "☀️ Away mode deactivated. Bot will stay quiet." }, { quoted: msg });
     return true;
   }
 
-  // Mute / Unmute Per Chat
   if (commandLower === ".mute") {
     state.mutedChats.add(jid);
-    await sock.sendMessage(jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
     return true;
   }
   if (commandLower === ".unmute") {
     state.mutedChats.delete(jid);
-    await sock.sendMessage(jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
     return true;
   }
 
@@ -566,7 +655,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * OpenRouter Gemini Text Response with Shared Knowledge Base Injection
+ * OpenRouter Gemini Text Response with Text Knowledge & Media Vault Recall
  */
 async function handleAIResponse(sock, msg, text, jid) {
   try {
@@ -575,32 +664,57 @@ async function handleAIResponse(sock, msg, text, jid) {
     const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
     const currentDate = new Date().toLocaleDateString();
 
-    // Load saved & auto-learned business facts
     const knowledgeBase = loadKnowledge();
     const knowledgeContext = knowledgeBase.length > 0
-      ? `\n- BUSINESS KNOWLEDGE BASE (Facts & Prices you must use when answering customers):\n  ${knowledgeBase.map((k, i) => `${i + 1}.${k}`).join('\n  ')}`
-      : '\n- BUSINESS KNOWLEDGE BASE: No specific facts recorded yet.';
+      ? `\n- BUSINESS KNOWLEDGE BASE (Facts & Prices):\n  ${knowledgeBase.map((k, i) => `${i + 1}.${k}`).join('\n  ')}`
+      : '\n- BUSINESS KNOWLEDGE BASE: None recorded.';
+
+    const mediaVault = loadMediaKnowledge();
+    const mediaContext = mediaVault.length > 0
+      ? `\n- ARCHIVED MEDIA VAULT (Images/Screenshots you can send to customers when requested):\n  ${mediaVault.map((m, i) => `[Index: ${i}] Instruction/Rule: "${m.instruction}" \vert{} FilePath: "${m.path}"`).join('\n  ')}`
+      : '\n- ARCHIVED MEDIA VAULT: None available.';
 
     const systemInstruction = `
       You are a personal WhatsApp AI assistant powered by Google Gemini via OpenRouter, replying on behalf of your owner who is currently away.
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       ${knowledgeContext}
-      - Goal 1: Respond naturally, concisely, and helpfully to questions. Use the Business Knowledge Base above to answer customer inquiries about prices, services, or details accurately.
-      - Goal 2: If asked about time or date, answer using the current context provided above.
-      - Goal 3: Mathematical Formatting: Whenever you write mathematical formulas, expressions, equations, or numbers, strictly use Unicode text characters (such as superscript/subscript digits like x², H₂O, square roots √, fractions like 1/2, operators like ±, ≤, ≥, ≠, ×, ÷, ∫, ∑). NEVER use LaTeX syntax, backslashes (\\), or dollar signs ($) for math.
-      - Goal 4: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
-        "[Translation: <English translation>]" followed by your response in the user's native language (or in English).
+      ${mediaContext}
+      - Goal 1: Respond naturally and helpfully to questions. Use the Business Knowledge Base above for facts.
+      - Goal 2: If a customer's request matches one of the ARCHIVED MEDIA VAULT items, you MUST output your response in this strict JSON format on the very first line: {"sendImage": true, "path": "<FilePath>", "caption": "<Your response text here>"}. If no image is needed, reply normally with plain text.
+      - Goal 3: Mathematical Formatting: Strictly use Unicode text characters (like x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
+      - Goal 4: Language Detection: If the user message is in another language, provide a brief English translation like "[Translation: ...]" at the start.
       - Keep responses short and suitable for chat messages.
     `;
 
-    const replyText = await callOpenRouterGemini(systemInstruction, text);
-
-    // Artificial typing delay for realism (2.5 seconds)
+    const rawResponse = await callOpenRouterGemini(systemInstruction, text);
     await new Promise(resolve => setTimeout(resolve, 2500));
+    await sock.sendPresenceUpdate('paused', jid);
 
-    if (replyText) {
-      await sock.sendPresenceUpdate('paused', jid);
-      await sock.sendMessage(jid, { text: replyText }, { quoted: msg });
+    let sentMedia = false;
+    if (rawResponse && rawResponse.trim().startsWith("{") && rawResponse.trim().endsWith("}")) {
+      try {
+        const parsed = JSON.parse(rawResponse.trim());
+        if (parsed.sendImage && parsed.path && fs.existsSync(parsed.path)) {
+          const imageBuffer = fs.readFileSync(parsed.path);
+          await sendBotMessage(sock, jid, { 
+            image: imageBuffer, 
+            caption: parsed.caption || "Here is the requested image." 
+          }, { quoted: msg });
+          sentMedia = true;
+        }
+      } catch (e) {
+        console.error("Failed to parse media dispatch JSON:", e.message);
+      }
+    }
+
+    if (!sentMedia && rawResponse) {
+      let cleanText = rawResponse;
+      try {
+        const parsed = JSON.parse(rawResponse.trim());
+        if (parsed.caption) cleanText = parsed.caption;
+      } catch (e) {}
+
+      await sendBotMessage(sock, jid, { text: cleanText }, { quoted: msg });
     }
   } catch (err) {
     console.error("OpenRouter Gemini error:", err);
@@ -609,7 +723,7 @@ async function handleAIResponse(sock, msg, text, jid) {
 }
 
 /**
- * Gemini Vision Handler for Incoming Images
+ * Gemini Vision Handler for Incoming Customer Images
  */
 async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
   try {
@@ -620,16 +734,10 @@ async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
     const base64Image = buffer.toString("base64");
-
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: [
-        {
-          inlineData: {
-            data: base64Image,
-            mimeType: "image/jpeg"
-          }
-        },
+        { inlineData: { data: base64Image, mimeType: "image/jpeg" } },
         { text: `You are a personal AI assistant. Answer this user prompt regarding the image: ${promptText}` }
       ]
     });
@@ -638,12 +746,12 @@ async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
     await sock.sendPresenceUpdate('paused', jid);
 
     if (response.text) {
-      await sock.sendMessage(jid, { text: response.text }, { quoted: msg });
+      await sendBotMessage(sock, jid, { text: response.text }, { quoted: msg });
     }
   } catch (err) {
     console.error("Gemini Vision error:", err);
     await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-    await sock.sendMessage(jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
+    await sendBotMessage(sock, jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
   }
 }
 
