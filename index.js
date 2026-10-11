@@ -4,7 +4,6 @@ import makeWASocket, {
   downloadContentFromMessage
 } from "@musteqeem/baileys";
 import OpenAI from "openai";
-import { GoogleGenAI } from "@google/genai";
 import { init as initPuter } from "@heyputer/puter.js/src/init.cjs";
 import express from "express";
 import fs from "fs";
@@ -71,10 +70,7 @@ function saveMediaKnowledge(data) {
 const apiKeys = (process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
 let currentKeyIndex = 0;
 
-// 2. Initialize Google Gemini for Direct Vision / Image Analysis
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-// 3. Initialize Puter for Image Generation (.imagine)
+// 2. Initialize Puter for Image Generation
 const puter = initPuter(process.env.PUTER_AUTH_TOKEN);
 
 // Global runtime variables
@@ -221,7 +217,49 @@ app.post("/api/pair", async (req, res) => {
   }
 });
 
-// --- OpenRouter Gemini AI Handler ---
+// --- OpenRouter Vision & Text Handlers with Key Rotation ---
+async function callOpenRouterVision(systemPrompt, base64Image, userText) {
+  if (apiKeys.length === 0) {
+    throw new Error("No OpenRouter API keys found in OPENROUTER_API_KEYS environment variable!");
+  }
+
+  let lastError = null;
+  for (let i = 0; i < apiKeys.length; i++) {
+    const apiKey = apiKeys[currentKeyIndex];
+    try {
+      const openrouter = new OpenAI({
+        apiKey: apiKey,
+        baseURL: "https://openrouter.ai/api/v1"
+      });
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+          ]
+        }
+      ];
+
+      const completion = await openrouter.chat.completions.create({
+        model: "google/gemini-2.5-flash",
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 500
+      });
+
+      return completion.choices[0]?.message?.content || "No response generated.";
+    } catch (err) {
+      console.warn(`⚠️ OpenRouter Vision API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
+      lastError = err;
+      currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+    }
+  }
+  throw lastError || new Error("All OpenRouter API keys failed for vision.");
+}
+
 async function callOpenRouterGemini(systemPrompt, userText) {
   if (apiKeys.length === 0) {
     throw new Error("No OpenRouter API keys found in OPENROUTER_API_KEYS environment variable!");
@@ -256,8 +294,42 @@ async function callOpenRouterGemini(systemPrompt, userText) {
   throw lastError || new Error("All OpenRouter API keys failed.");
 }
 
-// --- Archive Image & Instruction to Media Vault ---
-async function archiveMediaWithInstruction(imageMessage, instructionText) {
+// --- Background Auto-Learning from Text ---
+async function extractAndLearnFact(messageText) {
+  if (!messageText || messageText.length < 10 || messageText.startsWith(".")) return;
+
+  try {
+    const extractionPrompt = `
+      You are an automated knowledge extractor for a business WhatsApp bot.
+      Analyze the message below to see if it contains a clear, reusable business fact, price, service rule, policy, or common inquiry pattern.
+
+      - Message: "${messageText}"
+
+      Rules:
+      1. If the message states or implies a clear business fact/rule/price, return ONLY the concise factual statement.
+      2. If it is just casual greeting or temporary personal banter, return EXACTLY "NONE".
+      3. Do NOT add explanation or quotes. Return ONLY the factual statement or NONE.
+    `;
+
+    const extractedFact = await callOpenRouterGemini(extractionPrompt, "Extract fact if present.");
+    const cleanFact = extractedFact ? extractedFact.trim() : "NONE";
+
+    if (cleanFact !== "NONE" && cleanFact.length > 5 && !cleanFact.includes("NONE")) {
+      const knowledge = loadKnowledge();
+      const exists = knowledge.some(existing => existing.toLowerCase() === cleanFact.toLowerCase());
+      if (!exists) {
+        knowledge.push(cleanFact);
+        saveKnowledge(knowledge);
+        console.log(`🧠 [Quiet Auto-Learned Fact]: "${cleanFact}"`);
+      }
+    }
+  } catch (err) {
+    console.error("Text auto-learning error:", err.message);
+  }
+}
+
+// --- Background Auto-Archiving from Images via OpenRouter Vision ---
+async function archiveMediaWithAutoInstruction(imageMessage, captionText) {
   try {
     const stream = await downloadContentFromMessage(imageMessage, 'image');
     let buffer = Buffer.from([]);
@@ -267,19 +339,26 @@ async function archiveMediaWithInstruction(imageMessage, instructionText) {
     const filePath = path.join(MEDIA_DIR, fileName);
     fs.writeFileSync(filePath, buffer);
 
-    const cleanInstruction = instructionText ? instructionText.replace(/^\.remember\s*/i, "").trim() : "Important business image";
+    let instruction = captionText ? captionText.replace(/^\.remember\s*/i, "").trim() : "";
+    const base64Image = buffer.toString("base64");
+
+    if (!instruction) {
+      const visionPrompt = "Describe this image concisely so a bot knows when to send it to customers (e.g. \"Science Department Timetable 2026\", \"Price list flyer\"). Return ONLY the short description.";
+      const description = await callOpenRouterVision("You are a helpful media archivist.", base64Image, visionPrompt);
+      instruction = description ? description.trim() : "Important business image";
+    }
+
     const mediaVault = loadMediaKnowledge();
-    
     mediaVault.push({
       path: filePath,
-      instruction: cleanInstruction
+      instruction: instruction
     });
 
     saveMediaKnowledge(mediaVault);
-    console.log(`📸 [Media Vault Saved]: "${cleanInstruction}" -> ${filePath}`);
-    return cleanInstruction;
+    console.log(`📸 [Media Vault Auto-Saved via OpenRouter]: "${instruction}" -> ${filePath}`);
+    return instruction;
   } catch (err) {
-    console.error("Media archival error:", err.message);
+    console.error("Media auto-archival error:", err.message);
     return null;
   }
 }
@@ -305,7 +384,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Manual Memory & Media Vault!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Smart Puter & Media Vault Integration!");
     }
   });
 
@@ -317,6 +396,8 @@ async function startBot() {
 
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
+      const myNumber = sock.user?.id ? sock.user.id.split(':')[0] : '';
+      const isSelfChat = jid.includes(myNumber);
 
       // 1. Universal Disappearing Messages Reset
       if (!isFromMe && !state.checkedChats.has(jid)) {
@@ -346,23 +427,36 @@ async function startBot() {
         msg.message.imageMessage?.caption || 
         "";
 
-      // 2. OWNER COMMANDS & MEDIA ARCHIVING (Strictly manual via .remember)
+      // 2. OWNER ACTIONS
       if (isFromMe) {
         const hasImage = msg.message?.imageMessage;
 
-        if (hasImage) {
-          const savedInstruction = await archiveMediaWithInstruction(hasImage, text);
-          if (savedInstruction) {
-            await sock.sendMessage(jid, { text: `✅ *Image Saved to Media Vault!* Instruction:\n"${savedInstruction}"` }, { quoted: msg });
-          }
-          continue;
-        }
-
         if (text.startsWith(".")) {
+          if (hasImage) {
+            const savedInstruction = await archiveMediaWithAutoInstruction(hasImage, text);
+            if (savedInstruction) {
+              await sock.sendMessage(jid, { text: `✅ *Image Saved to Media Vault!* Instruction:\n"${savedInstruction}"` }, { quoted: msg });
+            }
+            continue;
+          }
+
           const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
           if (handledPublic) continue;
           const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
           if (handledAdmin) continue;
+        }
+
+        if (hasImage && isSelfChat) {
+          const savedInstruction = await archiveMediaWithAutoInstruction(hasImage, text);
+          if (savedInstruction) {
+            await sock.sendMessage(jid, { text: `📸 *Auto-Archived to Media Vault:* "${savedInstruction}"` }, { quoted: msg });
+          }
+          continue;
+        }
+
+        if (text && isSelfChat && !text.startsWith(".")) {
+          extractAndLearnFact(text).catch(e => console.error(e));
+          continue;
         }
 
         continue;
@@ -370,7 +464,13 @@ async function startBot() {
 
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 3. PUBLIC COMMANDS FOR CLIENTS
+      // 3. CLIENT CHAT QUIET LEARNING (20% Sample Rate) & RESPONSE LOOP
+      if (!isFromMe && text && !text.startsWith(".")) {
+        if (Math.random() < 0.20) {
+          extractAndLearnFact(text).catch(e => console.error(e));
+        }
+      }
+
       if (text.startsWith(".")) {
         const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
         if (handledPublic) continue;
@@ -378,14 +478,14 @@ async function startBot() {
 
       if (state.mutedChats.has(jid)) continue;
 
-      // Handle Incoming Customer Images with Gemini Vision
+      // Handle Incoming Customer Images with OpenRouter Vision
       const hasImage = msg.message?.imageMessage;
       if (hasImage && state.isAway) {
-        await handleVisionResponse(sock, msg, hasImage, text || "Describe this image", jid);
+        await handleOpenRouterVisionResponse(sock, msg, hasImage, text || "Describe this image", jid);
         continue;
       }
 
-      // Handle Text AI Response with Text Knowledge & Media Vault Recall
+      // Handle Text AI Response with Text Knowledge, Media Vault & Smart Puter Gen Recall
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
@@ -426,9 +526,8 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
     }
 
     menuText += `\n\n🌟 *Core Engines:*
-▫️ *Text:* Google Gemini via OpenRouter
-▫️ *Vision:* Google Gemini Flash
-▫️ *Images:* Puter AI Engine`;
+▫️ *Text & Vision:* Google Gemini via OpenRouter
+▫️ *Images:* Puter AI Engine (Smart Autopilot)`;
 
     await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
     return true;
@@ -472,7 +571,6 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 async function handleAdminCommands(sock, msg, text, jid) {
   const commandLower = text.trim().toLowerCase();
 
-  // 1. Remember fact manually
   if (commandLower.startsWith(".remember")) {
     const fact = text.replace(/^\.remember\s*/i, "").trim();
     if (!fact) {
@@ -488,11 +586,10 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // 2. View knowledge base
   if (commandLower === ".knowledge" || commandLower === ".facts") {
     const knowledge = loadKnowledge();
     if (knowledge.length === 0) {
-      await sock.sendMessage(jid, { text: "📂 Memory is empty. Use `.remember [fact]` to add knowledge." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "📂 Memory is empty. Use `.remember [fact]` or chat in your Self-Chat." }, { quoted: msg });
       return true;
     }
 
@@ -501,11 +598,10 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // 3. View media vault
   if (commandLower === ".media" || commandLower === ".vault") {
     const mediaVault = loadMediaKnowledge();
     if (mediaVault.length === 0) {
-      await sock.sendMessage(jid, { text: "📂 Media vault is empty. Send screenshots or flyers with instructions to archive them." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "📂 Media vault is empty. Send screenshots or flyers in your Self-Chat." }, { quoted: msg });
       return true;
     }
 
@@ -514,7 +610,6 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // 4. Robust .forget command handler
   if (commandLower.startsWith(".forget")) {
     const indexStr = text.replace(/^\.forget\s*/i, "").trim();
     const index = parseInt(indexStr) - 1;
@@ -532,7 +627,6 @@ async function handleAdminCommands(sock, msg, text, jid) {
     return true;
   }
 
-  // View-Once Command (.vv)
   if (commandLower === ".vv" || commandLower === ".viewonce") {
     const loadEmojis = ['⏳', '🔓', '👁️'];
     for (const emoji of loadEmojis) {
@@ -611,7 +705,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * OpenRouter Gemini Text Response with Text Knowledge & Media Vault Recall
+ * OpenRouter Gemini Text Response with Smart Puter AI Generation & Media Vault Dispatch
  */
 async function handleAIResponse(sock, msg, text, jid) {
   try {
@@ -627,7 +721,7 @@ async function handleAIResponse(sock, msg, text, jid) {
 
     const mediaVault = loadMediaKnowledge();
     const mediaContext = mediaVault.length > 0
-      ? `\n- ARCHIVED MEDIA VAULT (Images/Screenshots you can send to customers when requested):\n  ${mediaVault.map((m, i) => `[Index: ${i}] Instruction/Rule: "${m.instruction}" \vert{} FilePath: "${m.path}"`).join('\n  ')}`
+      ? `\n- ARCHIVED MEDIA VAULT (Images/Screenshots you can send when requested):\n  ${mediaVault.map((m, i) => `[Index: ${i}] Instruction/Rule: "${m.instruction}" \vert{} FilePath: "${m.path}"`).join('\n  ')}`
       : '\n- ARCHIVED MEDIA VAULT: None available.';
 
     const systemInstruction = `
@@ -636,37 +730,61 @@ async function handleAIResponse(sock, msg, text, jid) {
       ${knowledgeContext}
       ${mediaContext}
       - Goal 1: Respond naturally and helpfully to questions. Use the Business Knowledge Base above for facts.
-      - Goal 2: If a customer's request matches one of the ARCHIVED MEDIA VAULT items, you MUST output your response in this strict JSON format on the very first line: {"sendImage": true, "path": "<FilePath>", "caption": "<Your response text here>"}. If no image is needed, reply normally with plain text.
-      - Goal 3: Mathematical Formatting: Strictly use Unicode text characters (like x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
-      - Goal 4: Language Detection: If the user message is in another language, provide a brief English translation like "[Translation: ...]" at the start.
+      - Goal 2 (Media Vault Recall): If a customer's request matches one of the ARCHIVED MEDIA VAULT items above, output EXACTLY this JSON on the first line: {"sendImage": true, "path": "<FilePath>", "caption": "<Your response text here>"}
+      - Goal 3 (Smart Image Generation): If the customer is explicitly asking you to generate, design, draw, or sketch an image, flyer concept, or visual illustration, you can generate it using Puter AI by outputting EXACTLY this JSON on the first line: {"generateImage": true, "prompt": "<detailed image generation prompt>", "caption": "<Your response text here>"}
+      - Otherwise, reply normally with plain text.
+      - Goal 4: Mathematical Formatting: Strictly use Unicode text characters (like x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
+      - Goal 5: Language Detection: If the user message is in another language, provide a brief English translation like "[Translation: ...]" at the start.
       - Keep responses short and suitable for chat messages.
     `;
 
     const rawResponse = await callOpenRouterGemini(systemInstruction, text);
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
     await sock.sendPresenceUpdate('paused', jid);
 
-    let sentMedia = false;
-    if (rawResponse && rawResponse.trim().startsWith("{") && rawResponse.trim().endsWith("}")) {
+    let handledAction = false;
+    const trimmedResponse = rawResponse ? rawResponse.trim() : "";
+
+    if (trimmedResponse.startsWith("{") && trimmedResponse.endsWith("}")) {
       try {
-        const parsed = JSON.parse(rawResponse.trim());
+        const parsed = JSON.parse(trimmedResponse);
+
+        // Case A: Dispatch from Media Vault
         if (parsed.sendImage && parsed.path && fs.existsSync(parsed.path)) {
           const imageBuffer = fs.readFileSync(parsed.path);
           await sock.sendMessage(jid, { 
             image: imageBuffer, 
             caption: parsed.caption || "Here is the requested image." 
           }, { quoted: msg });
-          sentMedia = true;
+          handledAction = true;
+        } 
+        // Case B: Generate fresh image via Puter AI automatically
+        else if (parsed.generateImage && parsed.prompt) {
+          await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
+          await sock.sendPresenceUpdate('composing', jid);
+
+          const imageElement = await puter.ai.txt2img(parsed.prompt);
+          const imageUrl = imageElement.src || imageElement.url;
+
+          if (!imageUrl) throw new Error("No image URL returned from Puter AI.");
+
+          await sock.sendPresenceUpdate('paused', jid);
+          await sock.sendMessage(jid, { 
+            image: { url: imageUrl }, 
+            caption: parsed.caption || `🎨 *Generated Image*\nPrompt: "${parsed.prompt}"` 
+          }, { quoted: msg });
+          handledAction = true;
         }
       } catch (e) {
-        console.error("Failed to parse media dispatch JSON:", e.message);
+        console.error("Failed to parse dynamic AI action JSON:", e.message);
       }
     }
 
-    if (!sentMedia && rawResponse) {
+    if (!handledAction && rawResponse) {
       let cleanText = rawResponse;
       try {
-        const parsed = JSON.parse(rawResponse.trim());
+        const parsed = JSON.parse(trimmedResponse);
         if (parsed.caption) cleanText = parsed.caption;
       } catch (e) {}
 
@@ -679,9 +797,9 @@ async function handleAIResponse(sock, msg, text, jid) {
 }
 
 /**
- * Gemini Vision Handler for Incoming Customer Images
+ * OpenRouter Vision Handler for Incoming Customer Images
  */
-async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
+async function handleOpenRouterVisionResponse(sock, msg, imageMessage, promptText, jid) {
   try {
     await sock.sendPresenceUpdate('composing', jid);
 
@@ -690,22 +808,18 @@ async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
     const base64Image = buffer.toString("base64");
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        { inlineData: { data: base64Image, mimeType: "image/jpeg" } },
-        { text: `You are a personal AI assistant. Answer this user prompt regarding the image: ${promptText}` }
-      ]
-    });
+    const systemPrompt = "You are a personal AI assistant replying on behalf of your owner who is currently away. Answer the user prompt regarding the attached image accurately, concisely, and use Unicode for math.";
+    
+    const responseText = await callOpenRouterVision(systemPrompt, base64Image, promptText);
 
     await new Promise(resolve => setTimeout(resolve, 2000));
     await sock.sendPresenceUpdate('paused', jid);
 
-    if (response.text) {
-      await sock.sendMessage(jid, { text: response.text }, { quoted: msg });
+    if (responseText) {
+      await sock.sendMessage(jid, { text: responseText }, { quoted: msg });
     }
   } catch (err) {
-    console.error("Gemini Vision error:", err);
+    console.error("OpenRouter Vision error:", err);
     await sock.sendPresenceUpdate('paused', jid).catch(() => {});
     await sock.sendMessage(jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
   }
