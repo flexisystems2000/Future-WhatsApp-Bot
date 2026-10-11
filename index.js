@@ -88,18 +88,13 @@ const state = {
   checkedChats: new Set()
 };
 
-// --- Clean Safe Helper Wrapper (AI Badge & Meta Secure Label ONLY in Private Chats) ---
+// --- Helper Wrapper for Musteqeem's Baileys Fork (AI Badge & Meta Secure Label) ---
 async function sendBotMessage(targetSock, jid, messageContent, options = {}) {
-  const jidStr = typeof jid === 'string' ? jid : (Array.isArray(jid) ? jid[0] : '');
-  const isPrivateChat = jidStr && (jidStr.endsWith('@s.whatsapp.net') || jidStr.endsWith('@lid')) && !jidStr.includes('@g.us');
-
-  const enhancedPayload = { ...messageContent };
-
-  if (isPrivateChat) {
-    enhancedPayload.ai = true;
-    enhancedPayload.secureMetaServiceLabel = true;
-  }
-
+  const enhancedPayload = {
+    ...messageContent,
+    ai: true,
+    secureMetaServiceLabel: true
+  };
   return await targetSock.sendMessage(jid, enhancedPayload, options);
 }
 
@@ -354,7 +349,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Clean Private AI Badges & Media Vault!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Secure Service Meta Label & Media Vault!");
     }
   });
 
