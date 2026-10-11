@@ -77,12 +77,15 @@ const puter = initPuter(process.env.PUTER_AUTH_TOKEN);
 let sock = null;
 let isConnected = false;
 
-// Bot Memory State
+// Bot Memory State (activeConversations is now a Map storing JID -> Timestamp)
 const state = {
   isAway: true,
   mutedChats: new Set(),
-  checkedChats: new Set()
+  checkedChats: new Set(),
+  activeConversations: new Map() 
 };
+
+const INACTIVITY_TIMEOUT = 10 * 60 * 1000; // 10 minutes timeout for group auto-sleep
 
 // --- Web Dashboard UI ---
 app.get("/", (req, res) => {
@@ -384,7 +387,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Smart Puter & Media Vault Integration!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with 10-Min Inactivity Auto-Sleep!");
     }
   });
 
@@ -398,6 +401,7 @@ async function startBot() {
       const isFromMe = msg.key.fromMe;
       const myNumber = sock.user?.id ? sock.user.id.split(':')[0] : '';
       const isSelfChat = jid.includes(myNumber);
+      const isGroup = jid.endsWith('@g.us');
 
       // 1. Universal Disappearing Messages Reset
       if (!isFromMe && !state.checkedChats.has(jid)) {
@@ -464,7 +468,39 @@ async function startBot() {
 
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 3. CLIENT CHAT QUIET LEARNING (20% Sample Rate) & RESPONSE LOOP
+      // 3. TAG-TO-ENGAGE WITH INACTIVITY AUTO-SLEEP (10 MINS)
+      const now = Date.now();
+      const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+      const isTagged = mentions.some(m => m.includes(myNumber)) || text.includes(`@${myNumber}`);
+
+      // Check if group session expired due to inactivity
+      if (state.activeConversations.has(jid)) {
+        const lastActiveTime = state.activeConversations.get(jid);
+        if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
+          state.activeConversations.delete(jid); // Session expired! Bot goes back to sleep.
+        }
+      }
+
+      if (isTagged) {
+        state.activeConversations.set(jid, now); // Wake up & set/refresh timestamp
+      }
+
+      // GROUP CHATS: Strictly require a tag or an active, non-expired session
+      if (isGroup && !isTagged && !state.activeConversations.has(jid)) {
+        continue;
+      }
+
+      // If active in a group, refresh the inactivity timer on every message
+      if (isGroup && state.activeConversations.has(jid)) {
+        state.activeConversations.set(jid, now);
+      }
+
+      // PRIVATE CHATS: Respond automatically when Away Mode is ON (No tag required!)
+      if (!isGroup && !state.isAway) {
+        continue;
+      }
+
+      // 4. CLIENT CHAT QUIET LEARNING (20% Sample Rate)
       if (!isFromMe && text && !text.startsWith(".")) {
         if (Math.random() < 0.20) {
           extractAndLearnFact(text).catch(e => console.error(e));
@@ -485,7 +521,7 @@ async function startBot() {
         continue;
       }
 
-      // Handle Text AI Response with Text Knowledge, Media Vault & Smart Puter Gen Recall
+      // Handle Text AI Response
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
@@ -527,7 +563,7 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 
     menuText += `\n\n🌟 *Core Engines:*
 ▫️ *Text & Vision:* Google Gemini via OpenRouter
-▫️ *Images:* Puter AI Engine (Smart Autopilot)`;
+▫️ *Images:* Puter AI Engine`;
 
     await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
     return true;
@@ -729,28 +765,38 @@ async function handleAIResponse(sock, msg, text, jid) {
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       ${knowledgeContext}
       ${mediaContext}
-      - Goal 1: Respond naturally and helpfully to questions. Use the Business Knowledge Base above for facts.
-      - Goal 2 (Media Vault Recall): If a customer's request matches one of the ARCHIVED MEDIA VAULT items above, output EXACTLY this JSON on the first line: {"sendImage": true, "path": "<FilePath>", "caption": "<Your response text here>"}
-      - Goal 3 (Smart Image Generation): If the customer is explicitly asking you to generate, design, draw, or sketch an image, flyer concept, or visual illustration, you can generate it using Puter AI by outputting EXACTLY this JSON on the first line: {"generateImage": true, "prompt": "<detailed image generation prompt>", "caption": "<Your response text here>"}
-      - Otherwise, reply normally with plain text.
-      - Goal 4: Mathematical Formatting: Strictly use Unicode text characters (like x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
-      - Goal 5: Language Detection: If the user message is in another language, provide a brief English translation like "[Translation: ...]" at the start.
-      - Keep responses short and suitable for chat messages.
+
+      CRITICAL CONVERSATIONAL RULES:
+      - BREVITY IS MANDATORY: Keep your response under 1 to 3 sentences maximum. Be clear, concise, and direct.
+      - NO FILLER: Do not say "Hello!", "Thanks for reaching out", "I am happy to assist you", or any unnecessary pleasantries. Answer the prompt immediately.
+      - SILENCE ON GRATITUDE/ACKNOWLEDGMENTS: If the user says simple acknowledgments or greetings (e.g., "ok", "thanks", "noted", "cool", "thumbs up", "gm"), return EXACTLY "NONE" so the bot stays silent.
+
+      ACTION TRIGGERS:
+      - Media Vault Recall: If the request matches an item in ARCHIVED MEDIA VAULT, output EXACTLY this JSON on line 1: {"sendImage": true, "path": "<FilePath>", "caption": "<Very short response text>"}
+      - Smart Image Generation: If explicitly asked to generate, draw, or design an image/flyer, output EXACTLY this JSON on line 1: {"generateImage": true, "prompt": "<detailed prompt>", "caption": "<Very short response text>"}
+
+      FORMATTING:
+      - Strictly use Unicode text characters (x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
+      - If user speaks another language, include a brief translation like "[Translation: ...]" at the start.
     `;
 
     const rawResponse = await callOpenRouterGemini(systemInstruction, text);
     
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 1500));
     await sock.sendPresenceUpdate('paused', jid);
 
-    let handledAction = false;
     const trimmedResponse = rawResponse ? rawResponse.trim() : "";
+
+    if (!trimmedResponse || trimmedResponse === "NONE" || trimmedResponse.includes("NONE")) {
+      return;
+    }
+
+    let handledAction = false;
 
     if (trimmedResponse.startsWith("{") && trimmedResponse.endsWith("}")) {
       try {
         const parsed = JSON.parse(trimmedResponse);
 
-        // Case A: Dispatch from Media Vault
         if (parsed.sendImage && parsed.path && fs.existsSync(parsed.path)) {
           const imageBuffer = fs.readFileSync(parsed.path);
           await sock.sendMessage(jid, { 
@@ -759,7 +805,6 @@ async function handleAIResponse(sock, msg, text, jid) {
           }, { quoted: msg });
           handledAction = true;
         } 
-        // Case B: Generate fresh image via Puter AI automatically
         else if (parsed.generateImage && parsed.prompt) {
           await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
           await sock.sendPresenceUpdate('composing', jid);
