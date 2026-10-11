@@ -7,6 +7,7 @@ import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
 import { init as initPuter } from "@heyputer/puter.js/src/init.cjs";
 import express from "express";
+import fs from "fs";
 import pino from "pino";
 
 const app = express();
@@ -14,6 +15,27 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
+const KNOWLEDGE_FILE = "./knowledge.json";
+
+// Helper functions for Knowledge Base
+function loadKnowledge() {
+  try {
+    if (fs.existsSync(KNOWLEDGE_FILE)) {
+      return JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf8"));
+    }
+  } catch (e) {
+    console.error("Error loading knowledge file:", e);
+  }
+  return [];
+}
+
+function saveKnowledge(data) {
+  try {
+    fs.writeFileSync(KNOWLEDGE_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("Error saving knowledge file:", e);
+  }
+}
 
 // 1. Multi-API Key setup for OpenRouter rotation
 const apiKeys = (process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
@@ -35,7 +57,7 @@ const state = {
   mutedChats: new Set()
 };
 
-// --- Web Dashboard UI (Mobile & Desktop Responsive) ---
+// --- Web Dashboard UI ---
 app.get("/", (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -203,6 +225,40 @@ async function callOpenRouterGemini(systemPrompt, userText) {
   throw lastError || new Error("All OpenRouter API keys failed.");
 }
 
+// --- Background Auto-Learning Function ---
+async function extractAndLearnFact(ownerMessage) {
+  if (!ownerMessage || ownerMessage.length < 12 || ownerMessage.startsWith(".")) return;
+
+  try {
+    const extractionPrompt = `
+      You are an automated knowledge extractor for a business WhatsApp bot.
+      Analyze the owner's message below to see if it contains a clear, reusable business fact, price, service rule, policy, or location.
+
+      - Message: "${ownerMessage}"
+
+      Rules:
+      1. If the message states a clear fact/price (e.g., "A pen costs 2k", "We close at 8pm", "Delivery to Ikeja is 1500"), return ONLY the concise factual statement.
+      2. If the message is just a casual greeting, personal chat, small talk, or temporary answer (e.g. "I will call you back", "How are you?"), return EXACTLY "NONE".
+      3. Do NOT add explanation, markdown, or quotation marks. Return ONLY the factual statement or NONE.
+    `;
+
+    const extractedFact = await callOpenRouterGemini(extractionPrompt, "Extract fact if present.");
+    const cleanFact = extractedFact ? extractedFact.trim() : "NONE";
+
+    if (cleanFact !== "NONE" && cleanFact.length > 5 && !cleanFact.includes("NONE")) {
+      const knowledge = loadKnowledge();
+      const exists = knowledge.some(existing => existing.toLowerCase() === cleanFact.toLowerCase());
+      if (!exists) {
+        knowledge.push(cleanFact);
+        saveKnowledge(knowledge);
+        console.log(`🧠 [Auto-Learned New Fact]: "${cleanFact}"`);
+      }
+    }
+  } catch (err) {
+    console.error("Auto-learning extraction error:", err.message);
+  }
+}
+
 // --- Baileys Bot Logic ---
 async function startBot() {
   const { state: authState, saveCreds } = await useMultiFileAuthState("./auth_session");
@@ -224,7 +280,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active & Connected with Gemini via OpenRouter Rotation!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Hybrid Memory & Disappearing Message Protection!");
     }
   });
 
@@ -236,6 +292,19 @@ async function startBot() {
 
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
+
+      // 1. Auto-Reset Disappearing Messages to Default (Off = 0)
+      if (msg.messageStubType) {
+        const isEphemeralChange = (msg.messageStubType === 1 || msg.messageStubType === 68);
+        if (isEphemeralChange && !isFromMe) {
+          try {
+            await sock.sendMessage(jid, { disappearingMessagesInChat: 0 });
+            console.log(`🔒 Reset disappearing messages timer to default for chat: ${jid}`);
+          } catch (err) {
+            console.error("Failed to reset disappearing message timer:", err.message);
+          }
+        }
+      }
 
       // Read Receipts (Blue ticks)
       if (!isFromMe) {
@@ -251,16 +320,22 @@ async function startBot() {
 
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 1. PUBLIC COMMANDS (Accessible by ANY sender and the Bot Owner)
+      // 2. PUBLIC COMMANDS (Accessible by ANY sender and the Bot Owner)
       if (text.startsWith(".")) {
         const handledPublic = await handlePublicCommands(sock, msg, text, jid, isFromMe);
         if (handledPublic) continue;
       }
 
-      // 2. OWNER-ONLY ADMIN COMMANDS (Accessible ONLY by the Bot Owner)
+      // 3. OWNER-ONLY ADMIN & KNOWLEDGE COMMANDS
       if (isFromMe && text.startsWith(".")) {
         const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
         if (handledAdmin) continue;
+      }
+
+      // 4. OWNER AUTO-LEARNING (Passively learn facts from your outgoing conversations)
+      if (isFromMe && text && !text.startsWith(".")) {
+        extractAndLearnFact(text).catch(e => console.error(e));
+        continue;
       }
 
       // Ignore auto-responses if sent by yourself or if chat is muted
@@ -273,7 +348,7 @@ async function startBot() {
         continue;
       }
 
-      // Handle Text AI Response with OpenRouter Gemini Rotation
+      // Handle Text AI Response with OpenRouter Gemini Rotation & Shared Knowledge
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
@@ -283,7 +358,6 @@ async function startBot() {
 
 /**
  * Public Commands Handler (.imagine, .image, .menu)
- * Works for BOTH external senders and the owner.
  */
 async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
   const command = text.trim().toLowerCase();
@@ -304,11 +378,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 - Away Mode: ${awayStatus}
 - Chat Status: ${isMuted}
 
-🛠️ *Owner Admin Commands:*
-▫️ \`.vv\` - Reply to View-Once media to download it
+🛠️ *Owner Admin & Memory Commands:*
+▫️ \`.knowledge\` - View all auto-learned & saved facts
+▫️ \`.remember [fact]\` - Manually teach bot a fact
+▫️ \`.forget [number]\` - Delete a saved fact
+▫️ \`.vv\` - Reply to View-Once media
 ▫️ \`.away on/off\` - Toggle away auto-responder
-▫️ \`.mute / .unmute\` - Mute/Unmute bot in chat
-▫️ \`.block / .unblock\` - Manage blocked contacts`;
+▫️ \`.mute / .unmute\` - Mute/Unmute chat
+▫️ \`.block / .unblock\` - Block/Unblock contact`;
     }
 
     menuText += `\n\n🌟 *Core Engines:*
@@ -354,14 +431,60 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 }
 
 /**
- * Admin Commands Handler (.vv, .away, .mute, .block, etc.)
- * Strictly Restricted to the Bot Owner (isFromMe = true)
+ * Admin & Knowledge Base Commands Handler
  */
 async function handleAdminCommands(sock, msg, text, jid) {
-  const command = text.trim().toLowerCase();
+  const commandLower = text.trim().toLowerCase();
+
+  // 1. Remember a fact manually (.remember <fact>)
+  if (commandLower.startsWith(".remember ")) {
+    const fact = text.replace(/^\.remember\s+/i, "").trim();
+    if (!fact) {
+      await sock.sendMessage(jid, { text: "❌ Please provide a fact to remember. Example: `.remember Pen is 2k`" }, { quoted: msg });
+      return true;
+    }
+
+    const knowledge = loadKnowledge();
+    knowledge.push(fact);
+    saveKnowledge(knowledge);
+
+    await sock.sendMessage(jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
+    return true;
+  }
+
+  // 2. View all auto-learned & saved knowledge (.knowledge)
+  if (commandLower === ".knowledge" || commandLower === ".facts") {
+    const knowledge = loadKnowledge();
+    if (knowledge.length === 0) {
+      await sock.sendMessage(jid, { text: "📂 Memory is empty. Chat with contacts normally or use `.remember [fact]` to build knowledge." }, { quoted: msg });
+      return true;
+    }
+
+    const listText = knowledge.map((item, idx) => `*${idx + 1}.* ${item}`).join("\n");
+    await sock.sendMessage(jid, { text: `📂 *Learned Knowledge Base:*\n\n${listText}\n\n_To delete an entry, type .forget [number]_` }, { quoted: msg });
+    return true;
+  }
+
+  // 3. Forget a specific fact (.forget <number>)
+  if (commandLower.startsWith(".forget ")) {
+    const indexStr = text.replace(/^\.forget\s+/i, "").trim();
+    const index = parseInt(indexStr) - 1;
+    const knowledge = loadKnowledge();
+
+    if (isNaN(index) || index < 0 || index >= knowledge.length) {
+      await sock.sendMessage(jid, { text: "❌ Invalid number. Type `.knowledge` and use `.forget [number]`." }, { quoted: msg });
+      return true;
+    }
+
+    const removed = knowledge.splice(index, 1);
+    saveKnowledge(knowledge);
+
+    await sock.sendMessage(jid, { text: `🗑️ *Removed from memory:* "${removed[0]}"` }, { quoted: msg });
+    return true;
+  }
 
   // View-Once Command (.vv)
-  if (command === ".vv" || command === ".viewonce") {
+  if (commandLower === ".vv" || commandLower === ".viewonce") {
     const loadEmojis = ['⏳', '🔓', '👁️'];
     for (const emoji of loadEmojis) {
       await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
@@ -401,14 +524,14 @@ async function handleAdminCommands(sock, msg, text, jid) {
   }
 
   // Block / Unblock User
-  if (command.startsWith(".block")) {
+  if (commandLower.startsWith(".block")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "block");
     await sock.sendMessage(jid, { text: "🚫 User blocked." }, { quoted: msg });
     return true;
   }
   
-  if (command.startsWith(".unblock")) {
+  if (commandLower.startsWith(".unblock")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "unblock");
     await sock.sendMessage(jid, { text: "✅ User unblocked." }, { quoted: msg });
@@ -416,24 +539,24 @@ async function handleAdminCommands(sock, msg, text, jid) {
   }
 
   // Away Mode Control
-  if (command === ".away on") {
+  if (commandLower === ".away on") {
     state.isAway = true;
     await sock.sendMessage(jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
     return true;
   }
-  if (command === ".away off") {
+  if (commandLower === ".away off") {
     state.isAway = false;
     await sock.sendMessage(jid, { text: "☀️ Away mode deactivated. Bot will stay quiet." }, { quoted: msg });
     return true;
   }
 
   // Mute / Unmute Per Chat
-  if (command === ".mute") {
+  if (commandLower === ".mute") {
     state.mutedChats.add(jid);
     await sock.sendMessage(jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
     return true;
   }
-  if (command === ".unmute") {
+  if (commandLower === ".unmute") {
     state.mutedChats.delete(jid);
     await sock.sendMessage(jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
     return true;
@@ -443,7 +566,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * OpenRouter Gemini Text Response with Typing Animation
+ * OpenRouter Gemini Text Response with Shared Knowledge Base Injection
  */
 async function handleAIResponse(sock, msg, text, jid) {
   try {
@@ -452,12 +575,19 @@ async function handleAIResponse(sock, msg, text, jid) {
     const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
     const currentDate = new Date().toLocaleDateString();
 
+    // Load saved & auto-learned business facts
+    const knowledgeBase = loadKnowledge();
+    const knowledgeContext = knowledgeBase.length > 0
+      ? `\n- BUSINESS KNOWLEDGE BASE (Facts & Prices you must use when answering customers):\n  ${knowledgeBase.map((k, i) => `${i + 1}.${k}`).join('\n  ')}`
+      : '\n- BUSINESS KNOWLEDGE BASE: No specific facts recorded yet.';
+
     const systemInstruction = `
       You are a personal WhatsApp AI assistant powered by Google Gemini via OpenRouter, replying on behalf of your owner who is currently away.
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
-      - Goal 1: Respond naturally, concisely, and helpfully to questions.
+      ${knowledgeContext}
+      - Goal 1: Respond naturally, concisely, and helpfully to questions. Use the Business Knowledge Base above to answer customer inquiries about prices, services, or details accurately.
       - Goal 2: If asked about time or date, answer using the current context provided above.
-      - Goal 3: Mathematical Formatting: Whenever you write mathematical formulas, expressions, equations, or numbers, strictly use Unicode text characters (such as superscript/subscript digits like x², H₂O, square roots √, fractions like 1/2, operators like ±, ≤, ≥, ≠, ×, ÷, ∫, ∑). NEVER use LaTeX syntax, backslashes (\\), or dollar signs ($) for math, as they break and look weird on WhatsApp.
+      - Goal 3: Mathematical Formatting: Whenever you write mathematical formulas, expressions, equations, or numbers, strictly use Unicode text characters (such as superscript/subscript digits like x², H₂O, square roots √, fractions like 1/2, operators like ±, ≤, ≥, ≠, ×, ÷, ∫, ∑). NEVER use LaTeX syntax, backslashes (\\), or dollar signs ($) for math.
       - Goal 4: Language Detection: If the user message is written in ANY language other than English, provide a brief English translation at the beginning of your response formatted like:
         "[Translation: <English translation>]" followed by your response in the user's native language (or in English).
       - Keep responses short and suitable for chat messages.
