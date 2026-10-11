@@ -88,16 +88,6 @@ const state = {
   checkedChats: new Set()
 };
 
-// --- Helper Wrapper for Musteqeem's Baileys Fork (AI Badge & Meta Secure Label) ---
-async function sendBotMessage(targetSock, jid, messageContent, options = {}) {
-  const enhancedPayload = {
-    ...messageContent,
-    ai: true,
-    secureMetaServiceLabel: true
-  };
-  return await targetSock.sendMessage(jid, enhancedPayload, options);
-}
-
 // --- Web Dashboard UI ---
 app.get("/", (req, res) => {
   res.send(`
@@ -266,40 +256,6 @@ async function callOpenRouterGemini(systemPrompt, userText) {
   throw lastError || new Error("All OpenRouter API keys failed.");
 }
 
-// --- Background Auto-Learning from Text ---
-async function extractAndLearnFact(ownerMessage) {
-  if (!ownerMessage || ownerMessage.length < 12 || ownerMessage.startsWith(".")) return;
-
-  try {
-    const extractionPrompt = `
-      You are an automated knowledge extractor for a business WhatsApp bot.
-      Analyze the owner's message below to see if it contains a clear, reusable business fact, price, service rule, policy, or location.
-
-      - Message: "${ownerMessage}"
-
-      Rules:
-      1. If the message states a clear fact/price, return ONLY the concise factual statement.
-      2. If it is just casual greeting or temporary answer, return EXACTLY "NONE".
-      3. Do NOT add explanation or quotes. Return ONLY the factual statement or NONE.
-    `;
-
-    const extractedFact = await callOpenRouterGemini(extractionPrompt, "Extract fact if present.");
-    const cleanFact = extractedFact ? extractedFact.trim() : "NONE";
-
-    if (cleanFact !== "NONE" && cleanFact.length > 5 && !cleanFact.includes("NONE")) {
-      const knowledge = loadKnowledge();
-      const exists = knowledge.some(existing => existing.toLowerCase() === cleanFact.toLowerCase());
-      if (!exists) {
-        knowledge.push(cleanFact);
-        saveKnowledge(knowledge);
-        console.log(`🧠 [Auto-Learned Text Fact]: "${cleanFact}"`);
-      }
-    }
-  } catch (err) {
-    console.error("Text auto-learning error:", err.message);
-  }
-}
-
 // --- Archive Image & Instruction to Media Vault ---
 async function archiveMediaWithInstruction(imageMessage, instructionText) {
   try {
@@ -349,7 +305,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Secure Service Meta Label & Media Vault!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Manual Memory & Media Vault!");
     }
   });
 
@@ -362,10 +318,10 @@ async function startBot() {
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
 
-      // 1. Universal Secure Service Protocol Enforcement
+      // 1. Universal Disappearing Messages Reset
       if (!isFromMe && !state.checkedChats.has(jid)) {
         try {
-          await sendBotMessage(sock, jid, { disappearingMessagesInChat: false });
+          await sock.sendMessage(jid, { disappearingMessagesInChat: false });
           state.checkedChats.add(jid);
         } catch (err) {}
       }
@@ -374,7 +330,7 @@ async function startBot() {
         const isEphemeralChange = (msg.messageStubType === 1 || msg.messageStubType === 68);
         if (isEphemeralChange && !isFromMe) {
           try {
-            await sendBotMessage(sock, jid, { disappearingMessagesInChat: false });
+            await sock.sendMessage(jid, { disappearingMessagesInChat: false });
           } catch (err) {}
         }
       }
@@ -390,14 +346,14 @@ async function startBot() {
         msg.message.imageMessage?.caption || 
         "";
 
-      // 2. OWNER ACTIONS & MEDIA ARCHIVING
+      // 2. OWNER COMMANDS & MEDIA ARCHIVING (Strictly manual via .remember)
       if (isFromMe) {
         const hasImage = msg.message?.imageMessage;
 
         if (hasImage) {
           const savedInstruction = await archiveMediaWithInstruction(hasImage, text);
           if (savedInstruction) {
-            await sendBotMessage(sock, jid, { text: `✅ *Image Saved to Media Vault!* Link instruction:\n"${savedInstruction}"` }, { quoted: msg });
+            await sock.sendMessage(jid, { text: `✅ *Image Saved to Media Vault!* Instruction:\n"${savedInstruction}"` }, { quoted: msg });
           }
           continue;
         }
@@ -407,11 +363,6 @@ async function startBot() {
           if (handledPublic) continue;
           const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
           if (handledAdmin) continue;
-        }
-
-        if (text && !text.startsWith(".")) {
-          extractAndLearnFact(text).catch(e => console.error(e));
-          continue;
         }
 
         continue;
@@ -464,8 +415,8 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 - Chat Status: ${isMuted}
 
 🛠️ *Owner Admin & Memory Commands:*
-▫️ \`.knowledge\` - View all learned text facts
-▫️ \`.media\` - View all archived images & screenshots in vault
+▫️ \`.knowledge\` - View all saved text facts
+▫️ \`.media\` - View all archived images in vault
 ▫️ \`.remember [fact]\` - Manually teach bot a fact
 ▫️ \`.forget [number]\` - Delete a saved fact
 ▫️ \`.vv\` - Reply to View-Once media
@@ -479,14 +430,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 ▫️ *Vision:* Google Gemini Flash
 ▫️ *Images:* Puter AI Engine`;
 
-    await sendBotMessage(sock, jid, { text: menuText }, { quoted: msg });
+    await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
     return true;
   }
 
   if (command.startsWith(".imagine ") || command.startsWith(".image ")) {
     const prompt = text.replace(/^\.(imagine|image)\s+/i, "").trim();
     if (!prompt) {
-      await sendBotMessage(sock, jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Please provide a prompt. Example: `.imagine a futuristic Lagos city`" }, { quoted: msg });
       return true;
     }
 
@@ -500,14 +451,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
       if (!imageUrl) throw new Error("No image URL returned.");
 
       await sock.sendPresenceUpdate('paused', jid);
-      await sendBotMessage(sock, jid, { 
+      await sock.sendMessage(jid, { 
         image: { url: imageUrl }, 
         caption: `🎨 *Generated Image*\nPrompt: "${prompt}"` 
       }, { quoted: msg });
     } catch (err) {
       console.error("Image generation error:", err);
       await sock.sendPresenceUpdate('paused', jid);
-      await sendBotMessage(sock, jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Failed to generate image. Please try again." }, { quoted: msg });
     }
     return true;
   }
@@ -516,15 +467,16 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 }
 
 /**
- * Admin & Knowledge Base Commands Handler
+ * Admin & Knowledge Base Commands Handler (.remember, .knowledge, .forget)
  */
 async function handleAdminCommands(sock, msg, text, jid) {
   const commandLower = text.trim().toLowerCase();
 
-  if (commandLower.startsWith(".remember ")) {
-    const fact = text.replace(/^\.remember\s+/i, "").trim();
+  // 1. Remember fact manually
+  if (commandLower.startsWith(".remember")) {
+    const fact = text.replace(/^\.remember\s*/i, "").trim();
     if (!fact) {
-      await sendBotMessage(sock, jid, { text: "❌ Please provide a fact to remember. Example: `.remember Pen is 2k`" }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Please provide a fact to remember. Example: `.remember Pen is 2k`" }, { quoted: msg });
       return true;
     }
 
@@ -532,51 +484,55 @@ async function handleAdminCommands(sock, msg, text, jid) {
     knowledge.push(fact);
     saveKnowledge(knowledge);
 
-    await sendBotMessage(sock, jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
     return true;
   }
 
+  // 2. View knowledge base
   if (commandLower === ".knowledge" || commandLower === ".facts") {
     const knowledge = loadKnowledge();
     if (knowledge.length === 0) {
-      await sendBotMessage(sock, jid, { text: "📂 Memory is empty. Send text normally or use `.remember [fact]` to build knowledge." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "📂 Memory is empty. Use `.remember [fact]` to add knowledge." }, { quoted: msg });
       return true;
     }
 
     const listText = knowledge.map((item, idx) => `*${idx + 1}.* ${item}`).join("\n");
-    await sendBotMessage(sock, jid, { text: `📂 *Learned Text Knowledge Base:*\n\n${listText}\n\n_To delete an entry, type .forget [number]_` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `📂 *Saved Text Knowledge Base:*\n\n${listText}\n\n_To delete an entry, type .forget [number]_` }, { quoted: msg });
     return true;
   }
 
+  // 3. View media vault
   if (commandLower === ".media" || commandLower === ".vault") {
     const mediaVault = loadMediaKnowledge();
     if (mediaVault.length === 0) {
-      await sendBotMessage(sock, jid, { text: "📂 Media vault is empty. Send screenshots or flyers with captions to archive them." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "📂 Media vault is empty. Send screenshots or flyers with instructions to archive them." }, { quoted: msg });
       return true;
     }
 
     const listText = mediaVault.map((item, idx) => `*${idx + 1}.* ${item.instruction} (${path.basename(item.path)})`).join("\n");
-    await sendBotMessage(sock, jid, { text: `📸 *Archived Media Vault:*\n\n${listText}\n\n_The bot will automatically send these images when clients ask about them._` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `📸 *Archived Media Vault:*\n\n${listText}\n\n_The bot will automatically send these images when clients ask about them._` }, { quoted: msg });
     return true;
   }
 
-  if (commandLower.startsWith(".forget ")) {
-    const indexStr = text.replace(/^\.forget\s+/i, "").trim();
+  // 4. Robust .forget command handler
+  if (commandLower.startsWith(".forget")) {
+    const indexStr = text.replace(/^\.forget\s*/i, "").trim();
     const index = parseInt(indexStr) - 1;
     const knowledge = loadKnowledge();
 
     if (isNaN(index) || index < 0 || index >= knowledge.length) {
-      await sendBotMessage(sock, jid, { text: "❌ Invalid number. Type `.knowledge` and use `.forget [number]`." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Invalid or missing number. Usage: `.forget 1` (Type `.knowledge` to view list)." }, { quoted: msg });
       return true;
     }
 
     const removed = knowledge.splice(index, 1);
     saveKnowledge(knowledge);
 
-    await sendBotMessage(sock, jid, { text: `🗑️ *Removed from memory:* "${removed[0]}"` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `🗑️ *Removed from memory:* "${removed[0]}"` }, { quoted: msg });
     return true;
   }
 
+  // View-Once Command (.vv)
   if (commandLower === ".vv" || commandLower === ".viewonce") {
     const loadEmojis = ['⏳', '🔓', '👁️'];
     for (const emoji of loadEmojis) {
@@ -585,7 +541,7 @@ async function handleAdminCommands(sock, msg, text, jid) {
     
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     if (!quoted) {
-      await sendBotMessage(sock, jid, { text: "❌ Please reply to a View-Once message with .vv" }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Please reply to a View-Once message with .vv" }, { quoted: msg });
       return true;
     }
 
@@ -600,17 +556,17 @@ async function handleAdminCommands(sock, msg, text, jid) {
         for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
         
         if (vType === 'imageMessage') {
-          await sendBotMessage(sock, jid, { image: buffer, caption: "✅ View-Once Image Downloaded" }, { quoted: msg });
+          await sock.sendMessage(jid, { image: buffer, caption: "✅ View-Once Image Downloaded" }, { quoted: msg });
         } else if (vType === 'videoMessage') {
-          await sendBotMessage(sock, jid, { video: buffer, caption: "✅ View-Once Video Downloaded" }, { quoted: msg });
+          await sock.sendMessage(jid, { video: buffer, caption: "✅ View-Once Video Downloaded" }, { quoted: msg });
         } else if (vType === 'audioMessage') {
-          await sendBotMessage(sock, jid, { audio: buffer, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
+          await sock.sendMessage(jid, { audio: buffer, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
         }
       } catch (e) {
-        await sendBotMessage(sock, jid, { text: "❌ Failed to download View-Once media." }, { quoted: msg });
+        await sock.sendMessage(jid, { text: "❌ Failed to download View-Once media." }, { quoted: msg });
       }
     } else {
-      await sendBotMessage(sock, jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
+      await sock.sendMessage(jid, { text: "❌ Not a View-Once media message." }, { quoted: msg });
     }
     return true;
   }
@@ -618,36 +574,36 @@ async function handleAdminCommands(sock, msg, text, jid) {
   if (commandLower.startsWith(".block")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "block");
-    await sendBotMessage(sock, jid, { text: "🚫 User blocked." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "🚫 User blocked." }, { quoted: msg });
     return true;
   }
   
   if (commandLower.startsWith(".unblock")) {
     const targetJid = msg.message.extendedTextMessage?.contextInfo?.participant || jid;
     await sock.updateBlockStatus(targetJid, "unblock");
-    await sendBotMessage(sock, jid, { text: "✅ User unblocked." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "✅ User unblocked." }, { quoted: msg });
     return true;
   }
 
   if (commandLower === ".away on") {
     state.isAway = true;
-    await sendBotMessage(sock, jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "🌙 Away mode activated. Bot will auto-reply." }, { quoted: msg });
     return true;
   }
   if (commandLower === ".away off") {
     state.isAway = false;
-    await sendBotMessage(sock, jid, { text: "☀️ Away mode deactivated. Bot will stay quiet." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "☀️ Away mode deactivated. Bot will stay quiet." }, { quoted: msg });
     return true;
   }
 
   if (commandLower === ".mute") {
     state.mutedChats.add(jid);
-    await sendBotMessage(sock, jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
     return true;
   }
   if (commandLower === ".unmute") {
     state.mutedChats.delete(jid);
-    await sendBotMessage(sock, jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
     return true;
   }
 
@@ -696,7 +652,7 @@ async function handleAIResponse(sock, msg, text, jid) {
         const parsed = JSON.parse(rawResponse.trim());
         if (parsed.sendImage && parsed.path && fs.existsSync(parsed.path)) {
           const imageBuffer = fs.readFileSync(parsed.path);
-          await sendBotMessage(sock, jid, { 
+          await sock.sendMessage(jid, { 
             image: imageBuffer, 
             caption: parsed.caption || "Here is the requested image." 
           }, { quoted: msg });
@@ -714,7 +670,7 @@ async function handleAIResponse(sock, msg, text, jid) {
         if (parsed.caption) cleanText = parsed.caption;
       } catch (e) {}
 
-      await sendBotMessage(sock, jid, { text: cleanText }, { quoted: msg });
+      await sock.sendMessage(jid, { text: cleanText }, { quoted: msg });
     }
   } catch (err) {
     console.error("OpenRouter Gemini error:", err);
@@ -746,12 +702,12 @@ async function handleVisionResponse(sock, msg, imageMessage, promptText, jid) {
     await sock.sendPresenceUpdate('paused', jid);
 
     if (response.text) {
-      await sendBotMessage(sock, jid, { text: response.text }, { quoted: msg });
+      await sock.sendMessage(jid, { text: response.text }, { quoted: msg });
     }
   } catch (err) {
     console.error("Gemini Vision error:", err);
     await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-    await sendBotMessage(sock, jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "❌ Failed to analyze the image." }, { quoted: msg });
   }
 }
 
