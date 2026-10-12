@@ -132,6 +132,10 @@ const state = {
   activeConversations: new Map() // Stores JID -> Timestamp for auto-sleep
 };
 
+// Conversational Memory Store (JID -> Array of { role, content })
+const chatHistories = new Map();
+const MAX_HISTORY_LENGTH = 10;
+
 const INACTIVITY_TIMEOUT = 10 * 60 * 1000; // 10 minutes timeout for group auto-sleep
 
 // --- Web Dashboard UI ---
@@ -310,9 +314,20 @@ async function callOpenRouterVision(systemPrompt, base64Image, userText) {
   throw lastError || new Error("All OpenRouter API keys failed for vision.");
 }
 
-async function callOpenRouterGemini(systemPrompt, userText) {
+async function callOpenRouterChatWithHistory(systemPrompt, jid, userText) {
   if (apiKeys.length === 0) {
     throw new Error("No OpenRouter API keys found in OPENROUTER_API_KEYS environment variable!");
+  }
+
+  if (!chatHistories.has(jid)) {
+    chatHistories.set(jid, []);
+  }
+  const history = chatHistories.get(jid);
+
+  history.push({ role: "user", content: userText });
+
+  if (history.length > MAX_HISTORY_LENGTH) {
+    history.splice(0, history.length - MAX_HISTORY_LENGTH);
   }
 
   let lastError = null;
@@ -324,17 +339,22 @@ async function callOpenRouterGemini(systemPrompt, userText) {
         baseURL: "https://openrouter.ai/api/v1"
       });
 
+      const messagesPayload = [
+        { role: "system", content: systemPrompt },
+        ...history
+      ];
+
       const completion = await openrouter.chat.completions.create({
         model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userText }
-        ],
+        messages: messagesPayload,
         temperature: 0.7,
         max_tokens: 500
       });
 
-      return completion.choices[0]?.message?.content || "No response generated.";
+      const replyContent = completion.choices[0]?.message?.content || "No response generated.";
+      history.push({ role: "assistant", content: replyContent });
+
+      return replyContent;
     } catch (err) {
       console.warn(`⚠️ OpenRouter API Key index ${currentKeyIndex} failed: ${err.message}. Rotating key...`);
       lastError = err;
@@ -342,6 +362,53 @@ async function callOpenRouterGemini(systemPrompt, userText) {
     }
   }
   throw lastError || new Error("All OpenRouter API keys failed.");
+}
+
+async function callOpenRouterGemini(systemPrompt, userText) {
+  return callOpenRouterChatWithHistory(systemPrompt, "default_system", userText);
+}
+
+// --- Natural Language Command Parser ---
+async function parseNaturalCommand(userText) {
+  const commandParserPrompt = `
+    You are an intent parser for an administrative WhatsApp bot manager.
+    Examine the owner input text and classify if it matches an admin action command.
+
+    Supported Action Intents:
+    1. "REMEMBER_FACT": Owner wants to add a new text fact (e.g., "save that pen costs 2k", "remember that delivery is free").
+    2. "SHOW_KNOWLEDGE": Owner wants to view all facts (e.g., "show facts", "list knowledge").
+    3. "SHOW_MEDIA": Owner wants to view archived images (e.g., "show media vault", "list images").
+    4. "FORGET_FACT": Owner wants to delete a fact by index number (e.g., "forget item 2", "delete fact 1").
+    5. "SET_AWAY_ON": Owner wants to activate away mode (e.g., "turn on away mode", "enable auto reply").
+    6. "SET_AWAY_OFF": Owner wants to deactivate away mode (e.g., "turn off away mode", "disable auto reply").
+    7. "MUTE_CHAT": Owner wants to mute the current chat (e.g., "mute this chat", "be quiet here").
+    8. "UNMUTE_CHAT": Owner wants to unmute the current chat (e.g., "unmute chat", "speak here").
+    9. "SHOW_MENU": Owner wants to view the command menu/help list.
+    10. "NONE": Not an admin command.
+
+    Input: "${userText}"
+
+    Output format: STRICT JSON ONLY.
+    Example output for adding a fact:
+    {"action": "REMEMBER_FACT", "value": "Pen costs 2k"}
+
+    Example output for forget:
+    {"action": "FORGET_FACT", "value": 2}
+
+    Example output for no action:
+    {"action": "NONE"}
+  `;
+
+  try {
+    const rawResult = await callOpenRouterGemini(commandParserPrompt, userText);
+    const cleanResult = rawResult.trim();
+    if (cleanResult.startsWith("{") && cleanResult.endsWith("}")) {
+      return JSON.parse(cleanResult);
+    }
+  } catch (err) {
+    console.error("Natural language command parsing error:", err.message);
+  }
+  return { action: "NONE" };
 }
 
 // --- Background Auto-Learning from Text ---
@@ -434,7 +501,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Robust Tagging & Auto-Sleep!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with NLCU & History!");
     }
   });
 
@@ -478,10 +545,11 @@ async function startBot() {
         msg.message.imageMessage?.caption || 
         "";
 
-      // 2. OWNER ACTIONS
+      // 2. OWNER ACTIONS & NATURAL LANGUAGE COMMAND PROCESSING
       if (isFromMe) {
         const hasImage = msg.message?.imageMessage;
 
+        // Exact dot-commands fallback
         if (text.startsWith(".")) {
           if (hasImage) {
             const savedInstruction = await archiveMediaWithAutoInstruction(hasImage, text);
@@ -495,6 +563,15 @@ async function startBot() {
           if (handledPublic) continue;
           const handledAdmin = await handleAdminCommands(sock, msg, text, jid);
           if (handledAdmin) continue;
+        }
+
+        // Natural Language Command Handler for Owner
+        if (text && !hasImage) {
+          const parsedCommand = await parseNaturalCommand(text);
+          if (parsedCommand.action !== "NONE") {
+            const executed = await executeParsedAction(sock, msg, parsedCommand, jid);
+            if (executed) continue;
+          }
         }
 
         if (hasImage && isSelfChat) {
@@ -519,11 +596,12 @@ async function startBot() {
       const isTagged = isBotMentioned(sock, msg, text);
       const now = Date.now();
 
-      // Expire inactive group sessions after 10 minutes
+      // Expire inactive group sessions after 10 minutes and clear history
       if (state.activeConversations.has(jid)) {
         const lastActiveTime = state.activeConversations.get(jid);
         if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
           state.activeConversations.delete(jid);
+          chatHistories.delete(jid);
         }
       }
 
@@ -569,12 +647,93 @@ async function startBot() {
         continue;
       }
 
-      // Handle Text AI Response
+      // Handle Text AI Response with History
       if (state.isAway && text) {
         await handleAIResponse(sock, msg, text, jid);
       }
     }
   });
+}
+
+/**
+ * Executes Actions Parsed from Natural Language Inputs
+ */
+async function executeParsedAction(sock, msg, parsedCommand, jid) {
+  const { action, value } = parsedCommand;
+
+  if (action === "REMEMBER_FACT" && value) {
+    const knowledge = loadKnowledge();
+    knowledge.push(value);
+    saveKnowledge(knowledge);
+    await sock.sendMessage(jid, { text: `✅ *Fact Remembered!* (${knowledge.length} total facts)\n"${value}"` }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "SHOW_KNOWLEDGE") {
+    const knowledge = loadKnowledge();
+    if (knowledge.length === 0) {
+      await sock.sendMessage(jid, { text: "📂 Knowledge base is empty." }, { quoted: msg });
+      return true;
+    }
+    const listText = knowledge.map((item, idx) => `*${idx + 1}.* ${item}`).join("\n");
+    await sock.sendMessage(jid, { text: `📂 *Saved Text Knowledge Base:*\n\n${listText}` }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "SHOW_MEDIA") {
+    const mediaVault = loadMediaKnowledge();
+    if (mediaVault.length === 0) {
+      await sock.sendMessage(jid, { text: "📂 Media vault is empty." }, { quoted: msg });
+      return true;
+    }
+    const listText = mediaVault.map((item, idx) => `*${idx + 1}.* ${item.instruction} (${path.basename(item.path)})`).join("\n");
+    await sock.sendMessage(jid, { text: `📸 *Archived Media Vault:*\n\n${listText}` }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "FORGET_FACT" && value) {
+    const index = parseInt(value) - 1;
+    const knowledge = loadKnowledge();
+    if (isNaN(index) || index < 0 || index >= knowledge.length) {
+      await sock.sendMessage(jid, { text: "❌ Invalid fact index." }, { quoted: msg });
+      return true;
+    }
+    const removed = knowledge.splice(index, 1);
+    saveKnowledge(knowledge);
+    await sock.sendMessage(jid, { text: `🗑️ *Removed:* "${removed[0]}"` }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "SET_AWAY_ON") {
+    state.isAway = true;
+    await sock.sendMessage(jid, { text: "🌙 Away mode activated." }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "SET_AWAY_OFF") {
+    state.isAway = false;
+    await sock.sendMessage(jid, { text: "☀️ Away mode deactivated." }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "MUTE_CHAT") {
+    state.mutedChats.add(jid);
+    await sock.sendMessage(jid, { text: "🔇 Chat muted." }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "UNMUTE_CHAT") {
+    state.mutedChats.delete(jid);
+    await sock.sendMessage(jid, { text: "🔊 Chat unmuted." }, { quoted: msg });
+    return true;
+  }
+
+  if (action === "SHOW_MENU") {
+    await handlePublicCommands(sock, msg, ".menu", jid, true);
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -599,14 +758,14 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 - Away Mode: ${awayStatus}
 - Chat Status: ${isMuted}
 
-🛠️ *Owner Admin & Memory Commands:*
-▫️ \`.knowledge\` - View all saved text facts
-▫️ \`.media\` - View all archived images in vault
-▫️ \`.remember [fact]\` - Manually teach bot a fact
-▫️ \`.forget [number]\` - Delete a saved fact
+🛠️ *Owner Admin Commands (Supports Natural Language!):*
+▫️ \`save that [fact]\` or \`.remember [fact]\`
+▫️ \`show facts\` or \`.knowledge\`
+▫️ \`show media vault\` or \`.media\`
+▫️ \`forget item [number]\` or \`.forget [number]\`
+▫️ \`turn on/off away mode\` or \`.away on/off\`
+▫️ \`mute/unmute chat\` or \`.mute / .unmute\`
 ▫️ \`.vv\` - Reply to View-Once media
-▫️ \`.away on/off\` - Toggle away auto-responder
-▫️ \`.mute / .unmute\` - Mute/Unmute chat
 ▫️ \`.block / .unblock\` - Block/Unblock contact`;
     }
 
@@ -632,6 +791,7 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
     }
 
     await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
+    await sock.presenceSubscribe(jid);
     await sock.sendPresenceUpdate('composing', jid);
 
     try {
@@ -791,10 +951,11 @@ async function handleAdminCommands(sock, msg, text, jid) {
 }
 
 /**
- * OpenRouter Gemini Text Response with Smart Puter AI Generation & Media Vault Dispatch
+ * OpenRouter Gemini Text Response with Conversational History, Smart Puter AI Generation & Media Vault Dispatch
  */
 async function handleAIResponse(sock, msg, text, jid) {
   try {
+    await sock.presenceSubscribe(jid);
     await sock.sendPresenceUpdate('composing', jid);
 
     const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
@@ -810,13 +971,14 @@ async function handleAIResponse(sock, msg, text, jid) {
       ? `\n- ARCHIVED MEDIA VAULT (Images/Screenshots you can send when requested):\n  ${mediaVault.map((m, i) => `[Index: ${i}] Instruction/Rule: "${m.instruction}" \vert{} FilePath: "${m.path}"`).join('\n  ')}`
       : '\n- ARCHIVED MEDIA VAULT: None available.';
 
-        const systemInstruction = `
+    const systemInstruction = `
       You are a personal WhatsApp AI assistant powered by Google Gemini via OpenRouter, replying on behalf of your owner who is currently away.
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       ${knowledgeContext}
       ${mediaContext}
 
       CRITICAL CONVERSATIONAL RULES:
+      - CONVERSATION CONTINUITY: Pay attention to the chat history so you remember what the user was asking about or where they left off in the conversation.
       - GENERAL KNOWLEDGE & ASSISTANCE: You are fully intelligent and capable of answering general questions, coding problems, math, explanations, and creative requests outside of business facts. Do not claim you don't know unless it's truly impossible.
       - BREVITY IS MANDATORY: Keep your response under 1 to 3 sentences maximum. Be clear, concise, and direct.
       - FRIENDLY ON GREETINGS: If the user greets you (e.g., "hi", "hello", "gm", "good morning"), respond in a warm, brief, conversational way (1 sentence).
@@ -831,8 +993,7 @@ async function handleAIResponse(sock, msg, text, jid) {
       - If user speaks another language, include a brief translation like "[Translation: ...]" at the start.
     `;
 
-
-    const rawResponse = await callOpenRouterGemini(systemInstruction, text);
+    const rawResponse = await callOpenRouterChatWithHistory(systemInstruction, jid, text);
     
     await new Promise(resolve => setTimeout(resolve, 1500));
     await sock.sendPresenceUpdate('paused', jid);
@@ -859,6 +1020,7 @@ async function handleAIResponse(sock, msg, text, jid) {
         } 
         else if (parsed.generateImage && parsed.prompt) {
           await sock.sendMessage(jid, { react: { text: '🎨', key: msg.key } });
+          await sock.presenceSubscribe(jid);
           await sock.sendPresenceUpdate('composing', jid);
 
           const imageElement = await puter.ai.txt2img(parsed.prompt);
@@ -898,6 +1060,7 @@ async function handleAIResponse(sock, msg, text, jid) {
  */
 async function handleOpenRouterVisionResponse(sock, msg, imageMessage, promptText, jid) {
   try {
+    await sock.presenceSubscribe(jid);
     await sock.sendPresenceUpdate('composing', jid);
 
     const stream = await downloadContentFromMessage(imageMessage, 'image');
