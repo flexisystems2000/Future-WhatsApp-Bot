@@ -818,8 +818,8 @@ async function handleAIResponse(sock, msg, text, jid) {
 
       CRITICAL CONVERSATIONAL RULES:
       - BREVITY IS MANDATORY: Keep your response under 1 to 3 sentences maximum. Be clear, concise, and direct.
-      - NO FILLER: Do not say "Hello!", "Thanks for reaching out", "I am happy to assist you", or any unnecessary pleasantries. Answer the prompt immediately.
-      - SILENCE ON GRATITUDE/ACKNOWLEDGMENTS: If the user says simple acknowledgments or greetings (e.g., "ok", "thanks", "noted", "cool", "thumbs up", "gm"), return EXACTLY "NONE" so the bot stays silent.
+      - FRIENDLY ON GREETINGS: If the user greets you (e.g., "hi", "hello", "gm", "good morning"), respond in a warm, brief, conversational way (1 sentence).
+      - SILENCE ON PURE ACKNOWLEDGMENTS: If the user just sends a closing acknowledgment (e.g., "ok", "thanks", "noted", "thumbs up"), return EXACTLY "NONE" so the bot stays silent.
 
       ACTION TRIGGERS:
       - Media Vault Recall: If the request matches an item in ARCHIVED MEDIA VAULT, output EXACTLY this JSON on line 1: {"sendImage": true, "path": "<FilePath>", "caption": "<Very short response text>"}
