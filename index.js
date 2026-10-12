@@ -66,6 +66,55 @@ function saveMediaKnowledge(data) {
   }
 }
 
+// @musteqeem FIX: Normalize WhatsApp JIDs for reliable identity comparison.
+function normalizeWhatsAppId(value = "") {
+  return String(value)
+    .split("@")[0]
+    .split(":")[0]
+    .replace(/[^0-9]/g, "");
+}
+
+// @musteqeem FIX: Get the bot's connected WhatsApp identities.
+function getConnectedBotNumbers(sock) {
+  const identities = [
+    sock?.user?.id,
+    sock?.user?.lid
+  ];
+
+  return identities
+    .filter(Boolean)
+    .map(normalizeWhatsAppId)
+    .filter(Boolean);
+}
+
+// @musteqeem FIX: Detect mentions using WhatsApp metadata and @future.
+function isBotMentioned(sock, msg, text = "") {
+  const message = msg.message || {};
+
+  const contextInfo =
+    message.extendedTextMessage?.contextInfo ||
+    message.imageMessage?.contextInfo ||
+    message.videoMessage?.contextInfo ||
+    message.documentMessage?.contextInfo ||
+    message.buttonsResponseMessage?.contextInfo ||
+    message.listResponseMessage?.contextInfo ||
+    {};
+
+  const mentions = contextInfo.mentionedJid || [];
+  const botNumbers = getConnectedBotNumbers(sock);
+
+  const mentionMatchesBot = mentions.some(mentionedJid => {
+    const mentionedNumber = normalizeWhatsAppId(mentionedJid);
+
+    return botNumbers.includes(mentionedNumber);
+  });
+
+  // @musteqeem FIX: Preserve the @future activation keyword.
+  const mentionsFuture = /@future\b/i.test(text);
+
+  return mentionMatchesBot || mentionsFuture;
+}
+
 // 1. Multi-API Key setup for OpenRouter rotation
 const apiKeys = (process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY || "").split(",").map(k => k.trim()).filter(Boolean);
 let currentKeyIndex = 0;
@@ -468,37 +517,61 @@ async function startBot() {
 
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 3. TAG-TO-ENGAGE LOGIC WITH ROBUST MATCHING & INACTIVITY AUTO-SLEEP
-      const now = Date.now();
-      const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-      
-      // Robust tag detection: checks mentioned JIDs, phone number, or @future tag name
-      const isTagged = mentions.some(m => m.includes(myNumber)) || 
-                       text.includes(`@${myNumber}`) || 
-                       text.toLowerCase().includes("@future");
+// 3. TAG-TO-ENGAGE LOGIC WITH ROBUST MATCHING & INACTIVITY AUTO-SLEEP
 
-      // Check if group active session expired (10 mins silence)
-      if (state.activeConversations.has(jid)) {
-        const lastActiveTime = state.activeConversations.get(jid);
-        if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
-          state.activeConversations.delete(jid); // Expired session -> Bot sleeps
-        }
+// @musteqeem FIX: Detect actual mentions and the @future keyword.
+const isTagged = isBotMentioned(sock, msg, text);
+
+const now = Date.now();
+
+// @musteqeem FIX: Expire inactive group sessions after 10 minutes.
+if (state.activeConversations.has(jid)) {
+  const lastActiveTime = state.activeConversations.get(jid);
+
+  if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
+    state.activeConversations.delete(jid);
+  }
+}
+
+// @musteqeem FIX: React to a detected group tag to confirm detection.
+if (isGroup && isTagged) {
+  try {
+    await sock.sendMessage(jid, {
+      react: {
+        text: "👀",
+        key: msg.key
       }
+    });
 
-      if (isTagged) {
-        state.activeConversations.set(jid, now); // Wake up and set/refresh timer
-      }
+    console.log(
+      `🏷️ [@musteqeem FIX] Tag detected in group: ${jid}`
+    );
+  } catch (err) {
+    console.error(
+      "[@musteqeem FIX] Failed to react to tag:",
+      err.message
+    );
+  }
+}
 
-      // GROUP CHATS: Requires explicit tag or active, unexpired session
-      if (isGroup && !isTagged && !state.activeConversations.has(jid)) {
-        continue;
-      }
+// @musteqeem FIX: Wake up the bot when explicitly tagged in a group.
+if (isGroup && isTagged) {
+  state.activeConversations.set(jid, now);
+}
 
-      // Refresh activity timer for active group conversations
-      if (isGroup && state.activeConversations.has(jid)) {
-        state.activeConversations.set(jid, now);
-      }
+// @musteqeem FIX: Ignore ordinary messages when the group session is asleep.
+if (
+  isGroup &&
+  !isTagged &&
+  !state.activeConversations.has(jid)
+) {
+  continue;
+}
 
+// @musteqeem FIX: Refresh the timer during an active group conversation.
+if (isGroup && state.activeConversations.has(jid)) {
+  state.activeConversations.set(jid, now);
+}
       // PRIVATE CHATS: Auto-reply when Away Mode is ON (No tag needed)
       if (!isGroup && !state.isAway) {
         continue;
