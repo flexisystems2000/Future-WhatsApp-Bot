@@ -810,13 +810,14 @@ async function handleAIResponse(sock, msg, text, jid) {
       ? `\n- ARCHIVED MEDIA VAULT (Images/Screenshots you can send when requested):\n  ${mediaVault.map((m, i) => `[Index: ${i}] Instruction/Rule: "${m.instruction}" \vert{} FilePath: "${m.path}"`).join('\n  ')}`
       : '\n- ARCHIVED MEDIA VAULT: None available.';
 
-    const systemInstruction = `
+        const systemInstruction = `
       You are a personal WhatsApp AI assistant powered by Google Gemini via OpenRouter, replying on behalf of your owner who is currently away.
       - Context: Current Date is ${currentDate}, Current Time is ${currentTime}.
       ${knowledgeContext}
       ${mediaContext}
 
       CRITICAL CONVERSATIONAL RULES:
+      - GENERAL KNOWLEDGE & ASSISTANCE: You are fully intelligent and capable of answering general questions, coding problems, math, explanations, and creative requests outside of business facts. Do not claim you don't know unless it's truly impossible.
       - BREVITY IS MANDATORY: Keep your response under 1 to 3 sentences maximum. Be clear, concise, and direct.
       - FRIENDLY ON GREETINGS: If the user greets you (e.g., "hi", "hello", "gm", "good morning"), respond in a warm, brief, conversational way (1 sentence).
       - SILENCE ON PURE ACKNOWLEDGMENTS: If the user just sends a closing acknowledgment (e.g., "ok", "thanks", "noted", "thumbs up"), return EXACTLY "NONE" so the bot stays silent.
@@ -829,6 +830,7 @@ async function handleAIResponse(sock, msg, text, jid) {
       - Strictly use Unicode text characters (x², √, 1/2, ±, ≠) for math. NEVER use LaTeX syntax or dollar signs ($).
       - If user speaks another language, include a brief translation like "[Translation: ...]" at the start.
     `;
+
 
     const rawResponse = await callOpenRouterGemini(systemInstruction, text);
     
