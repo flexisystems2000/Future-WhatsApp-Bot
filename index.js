@@ -77,12 +77,12 @@ const puter = initPuter(process.env.PUTER_AUTH_TOKEN);
 let sock = null;
 let isConnected = false;
 
-// Bot Memory State (activeConversations is now a Map storing JID -> Timestamp)
+// Bot Memory State
 const state = {
   isAway: true,
   mutedChats: new Set(),
   checkedChats: new Set(),
-  activeConversations: new Map() 
+  activeConversations: new Map() // Stores JID -> Timestamp for auto-sleep
 };
 
 const INACTIVITY_TIMEOUT = 10 * 60 * 1000; // 10 minutes timeout for group auto-sleep
@@ -387,7 +387,7 @@ async function startBot() {
       }
     } else if (connection === "open") {
       isConnected = true;
-      console.log("✅ Personal Multi-AI WhatsApp Bot Active with 10-Min Inactivity Auto-Sleep!");
+      console.log("✅ Personal Multi-AI WhatsApp Bot Active with Robust Tagging & Auto-Sleep!");
     }
   });
 
@@ -468,34 +468,38 @@ async function startBot() {
 
       if (!text && !msg.message?.imageMessage) continue;
 
-      // 3. TAG-TO-ENGAGE WITH INACTIVITY AUTO-SLEEP (10 MINS)
+      // 3. TAG-TO-ENGAGE LOGIC WITH ROBUST MATCHING & INACTIVITY AUTO-SLEEP
       const now = Date.now();
       const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-      const isTagged = mentions.some(m => m.includes(myNumber)) || text.includes(`@${myNumber}`);
+      
+      // Robust tag detection: checks mentioned JIDs, phone number, or @future tag name
+      const isTagged = mentions.some(m => m.includes(myNumber)) || 
+                       text.includes(`@${myNumber}`) || 
+                       text.toLowerCase().includes("@future");
 
-      // Check if group session expired due to inactivity
+      // Check if group active session expired (10 mins silence)
       if (state.activeConversations.has(jid)) {
         const lastActiveTime = state.activeConversations.get(jid);
         if (now - lastActiveTime > INACTIVITY_TIMEOUT) {
-          state.activeConversations.delete(jid); // Session expired! Bot goes back to sleep.
+          state.activeConversations.delete(jid); // Expired session -> Bot sleeps
         }
       }
 
       if (isTagged) {
-        state.activeConversations.set(jid, now); // Wake up & set/refresh timestamp
+        state.activeConversations.set(jid, now); // Wake up and set/refresh timer
       }
 
-      // GROUP CHATS: Strictly require a tag or an active, non-expired session
+      // GROUP CHATS: Requires explicit tag or active, unexpired session
       if (isGroup && !isTagged && !state.activeConversations.has(jid)) {
         continue;
       }
 
-      // If active in a group, refresh the inactivity timer on every message
+      // Refresh activity timer for active group conversations
       if (isGroup && state.activeConversations.has(jid)) {
         state.activeConversations.set(jid, now);
       }
 
-      // PRIVATE CHATS: Respond automatically when Away Mode is ON (No tag required!)
+      // PRIVATE CHATS: Auto-reply when Away Mode is ON (No tag needed)
       if (!isGroup && !state.isAway) {
         continue;
       }
@@ -512,6 +516,7 @@ async function startBot() {
         if (handledPublic) continue;
       }
 
+      // Check if muted
       if (state.mutedChats.has(jid)) continue;
 
       // Handle Incoming Customer Images with OpenRouter Vision
@@ -530,7 +535,7 @@ async function startBot() {
 }
 
 /**
- * Public Commands Handler (.imagine, .image, .menu)
+ * Public Commands Handler (.imagine, .image, .menu, .unmute)
  */
 async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
   const command = text.trim().toLowerCase();
@@ -543,6 +548,7 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 
 🎨 *Public Commands:*
 ▫️ \`.imagine [prompt]\` - Generate image via Puter AI
+▫️ \`.unmute\` - Unmute bot in this chat
 ▫️ \`.menu\` - Display available commands`;
 
     if (isFromMe) {
@@ -566,6 +572,12 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 ▫️ *Images:* Puter AI Engine`;
 
     await sock.sendMessage(jid, { text: menuText }, { quoted: msg });
+    return true;
+  }
+
+  if (command === ".unmute") {
+    state.mutedChats.delete(jid);
+    await sock.sendMessage(jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
     return true;
   }
 
@@ -729,11 +741,6 @@ async function handleAdminCommands(sock, msg, text, jid) {
   if (commandLower === ".mute") {
     state.mutedChats.add(jid);
     await sock.sendMessage(jid, { text: "🔇 Bot muted for this chat." }, { quoted: msg });
-    return true;
-  }
-  if (commandLower === ".unmute") {
-    state.mutedChats.delete(jid);
-    await sock.sendMessage(jid, { text: "🔊 Bot unmuted for this chat." }, { quoted: msg });
     return true;
   }
 
