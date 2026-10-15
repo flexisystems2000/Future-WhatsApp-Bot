@@ -136,6 +136,43 @@ const state = {
 const chatHistories = new Map();
 const MAX_HISTORY_LENGTH = 10;
 
+// Cache recent raw WhatsApp messages so .inspect can examine original message
+// keys, including alternate IDs when Baileys exposes them.
+const recentMessagesById = new Map();
+const MAX_CACHED_MESSAGES = 1000;
+
+function cacheRawMessage(msg) {
+  const messageId = msg?.key?.id;
+  if (!messageId) return;
+  recentMessagesById.set(messageId, msg);
+
+  // Keep memory bounded on long-running bot instances.
+  while (recentMessagesById.size > MAX_CACHED_MESSAGES) {
+    recentMessagesById.delete(recentMessagesById.keys().next().value);
+  }
+}
+
+function getMessageBody(message = {}) {
+  const content = message.message || {};
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
+    content.buttonsResponseMessage?.selectedDisplayText ||
+    content.listResponseMessage?.title ||
+    content.templateButtonReplyMessage?.selectedDisplayText ||
+    content.interactiveResponseMessage?.body?.text ||
+    ""
+  );
+}
+
+function getMessageType(message = {}) {
+  const content = message.message || {};
+  return Object.keys(content).find(key => key !== "messageContextInfo") || "unknown";
+}
+
 const INACTIVITY_TIMEOUT = 10 * 60 * 1000; // 10 minutes timeout for group auto-sleep
 
 // --- Web Dashboard UI ---
@@ -511,6 +548,9 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg?.message) continue;
 
+      // Preserve the complete original message before command processing.
+      cacheRawMessage(msg);
+
       const jid = msg.key.remoteJid;
       const isFromMe = msg.key.fromMe;
       const myNumber = sock.user?.id ? sock.user.id.split(':')[0] : '';
@@ -766,6 +806,7 @@ async function handlePublicCommands(sock, msg, text, jid, isFromMe) {
 ▫️ \`turn on/off away mode\` or \`.away on/off\`
 ▫️ \`mute/unmute chat\` or \`.mute / .unmute\`
 ▫️ \`.vv\` - Reply to View-Once media
+▫️ \`.inspect\` - Reply to a message to inspect its WhatsApp IDs/metadata
 ▫️ \`.block / .unblock\` - Block/Unblock contact`;
     }
 
@@ -834,6 +875,77 @@ async function handleAdminCommands(sock, msg, text, jid) {
     saveKnowledge(knowledge);
 
     await sock.sendMessage(jid, { text: `✅ *Fact Saved to Memory!* (${knowledge.length} total facts)\n"${fact}"` }, { quoted: msg });
+    return true;
+  }
+
+  if (commandLower === ".inspect" || commandLower.startsWith(".inspect ")) {
+    const contextInfo =
+      msg.message?.extendedTextMessage?.contextInfo ||
+      msg.message?.imageMessage?.contextInfo ||
+      msg.message?.videoMessage?.contextInfo ||
+      msg.message?.documentMessage?.contextInfo ||
+      {};
+
+    const quotedId = contextInfo.stanzaId;
+    if (!quotedId) {
+      await sock.sendMessage(jid, {
+        text: "Reply directly to the WhatsApp message you want to inspect, then send `.inspect`. This command is owner-only."
+      }, { quoted: msg });
+      return true;
+    }
+
+    const target = recentMessagesById.get(quotedId);
+    const quotedMessage = contextInfo.quotedMessage || {};
+    const raw = target || {
+      key: {
+        id: quotedId,
+        remoteJid: contextInfo.remoteJid || jid,
+        participant: contextInfo.participant || null
+      },
+      message: quotedMessage,
+      pushName: null,
+      messageTimestamp: null
+    };
+
+    const rawKey = raw.key || {};
+    const sender = rawKey.participant || rawKey.remoteJid ||
+      contextInfo.participant || contextInfo.remoteJid || jid;
+    const senderAlt = rawKey.participantAlt || rawKey.remoteJidAlt || null;
+
+    const metadata = {
+      raw: {
+        key: {
+          remoteJid: rawKey.remoteJid || contextInfo.remoteJid || jid,
+          fromMe: rawKey.fromMe ?? null,
+          id: rawKey.id || quotedId,
+          participant: rawKey.participant || contextInfo.participant || null,
+          participantAlt: rawKey.participantAlt || null,
+          remoteJidAlt: rawKey.remoteJidAlt || null,
+          addressingMode: rawKey.addressingMode || null
+        },
+        pushName: raw.pushName || null,
+        messageTimestamp: raw.messageTimestamp ?? null,
+        messageType: getMessageType(raw),
+        body: getMessageBody(raw)
+      },
+      sender,
+      senderAlt,
+      number: normalizeWhatsAppId(sender),
+      pushName: raw.pushName || null,
+      type: getMessageType(raw),
+      body: getMessageBody(raw),
+      quoted: {
+        stanzaId: quotedId,
+        participant: contextInfo.participant || null,
+        remoteJid: contextInfo.remoteJid || null,
+        messageAvailableInCache: Boolean(target)
+      }
+    };
+
+    const output = JSON.stringify(metadata, null, 2);
+    await sock.sendMessage(jid, {
+      text: `*WhatsApp Message Metadata*\n\n\`\`\`json\n${output.slice(0, 12000)}\n\`\`\``
+    }, { quoted: msg });
     return true;
   }
 
